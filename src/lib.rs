@@ -59,9 +59,10 @@ pub use conn::{AsyncStream, ProxyConn};
 pub use dns_proxy::{DnsHandler, DnsUdpProxy};
 pub use forward::{TcpDirectForwardHandler, UdpDirectForwardHandler};
 pub use ftcp::{FakeTcpListenConfig, FakeTcpListener, FakeTcpTransporter};
+pub use h2_transport::{H2Config, H2Handler, H2Stream};
 pub use handler::{Handler, HandlerOptions};
 pub use hosts::{Host, Hosts};
-pub use http2_transport::{Http2Connector, Http2Handler, Http2Transporter};
+pub use http2_transport::{http2_connect, Http2Handler};
 pub use http_proxy::{HttpConnector, HttpHandler};
 pub use kcp::{
     kcp_connect, Crypt, KcpConfig, KcpListener, KcpStream, KcpTransporter, SnappyStream,

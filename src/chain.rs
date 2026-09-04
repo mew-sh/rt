@@ -596,6 +596,22 @@ async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, Ch
                 })?;
             Ok(ProxyConn::layered(Box::new(ws), peer, local))
         }
+        // `http2` layers only TLS here; its CONNECT is the protocol connector
+        // below, which is how gost splits transporter from connector
+        // (http2.go:122-199).
+        "http2" => {
+            let insecure = !node.get_bool("secure");
+            let host = hop_hostname(node);
+            let peer = stream.peer_addr();
+            let local = stream.local_addr();
+            let tls =
+                crate::tls_transport::tls_connect_stream_alpn(stream, &host, insecure, &["h2"])
+                    .await
+                    .map_err(|e| {
+                        ChainError::ProxyError(format!("TLS handshake with {} failed: {}", host, e))
+                    })?;
+            Ok(ProxyConn::layered(Box::new(tls), peer, local))
+        }
         // Like `wss`, `h2` composes TLS underneath rather than opening a
         // second socket; `h2c` is the cleartext form.
         "h2" | "h2c" => {
@@ -607,7 +623,7 @@ async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, Ch
             let inner: Box<dyn crate::conn::AsyncStream> = if node.transport == "h2" {
                 let insecure = !node.get_bool("secure");
                 Box::new(
-                    crate::tls_transport::tls_connect_stream(stream, &host, insecure)
+                    crate::tls_transport::tls_connect_stream_alpn(stream, &host, insecure, &["h2"])
                         .await
                         .map_err(|e| {
                             ChainError::ProxyError(format!(
@@ -881,6 +897,17 @@ async fn connect_via(
         // CONNECT is ever sent, so a node like `-F tls://host:443` reaches the
         // proxy and then asks it for nothing.
         "http" | "" => http_connect(stream, target, node.user.as_ref()).await,
+        // The TLS layer already ran; this opens the CONNECT stream on it.
+        "http2" => {
+            let peer = stream.peer_addr();
+            let local = stream.local_addr();
+            let tunnel = crate::http2_transport::http2_connect(stream, target)
+                .await
+                .map_err(|e| {
+                    ChainError::ProxyError(format!("HTTP/2 CONNECT to {} failed: {}", target, e))
+                })?;
+            Ok(ProxyConn::layered(Box::new(tunnel), peer, local))
+        }
         "socks5" => socks5_connect(stream, target, node.user.as_ref()).await,
         "socks4" => socks4_connect(stream, target, node.user.as_ref(), false).await,
         "socks4a" => socks4_connect(stream, target, node.user.as_ref(), true).await,

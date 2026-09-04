@@ -347,7 +347,7 @@ fn load_secrets_file(path: &str) -> Result<LocalAuthenticator, std::io::Error> {
 /// plaintext TCP under an encrypted-looking scheme.
 const SUPPORTED_LISTENER_TRANSPORTS: &[&str] = &[
     "tcp", "tls", "ws", "wss", "mtls", "mws", "mwss", "quic", "kcp", "udp", "rtcp", "rudp", "dns",
-    "redu", "h2", "h2c",
+    "redu", "h2", "h2c", "http2",
 ];
 
 fn ensure_listener_transport_supported(
@@ -382,7 +382,18 @@ fn ensure_chain_transport_supported(node: &Node) -> Result<(), Box<dyn std::erro
     }
     if matches!(
         transport,
-        "" | "tcp" | "tls" | "ws" | "wss" | "mtls" | "mws" | "mwss" | "quic" | "kcp" | "h2" | "h2c"
+        "" | "tcp"
+            | "tls"
+            | "ws"
+            | "wss"
+            | "mtls"
+            | "mws"
+            | "mwss"
+            | "quic"
+            | "kcp"
+            | "h2"
+            | "h2c"
+            | "http2"
     ) {
         return Ok(());
     }
@@ -580,11 +591,26 @@ async fn run_server(
             });
             server.serve().await
         }
+        // `http2` is a proxy rather than a tunnel, so its handler already
+        // owns the HTTP/2 session; only the TLS underneath is set up here.
+        "http2" => {
+            let mut config = tls_server_config(&node)?;
+            config.alpn_protocols = vec![b"h2".to_vec()];
+            let server = TlsServer::new(&addr, config, handler).await?;
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
         "h2" | "h2c" => {
             let h2_config = h2_transport::H2Config::from_node(&node);
             let handler = h2_transport::H2Handler::new(handler, h2_config);
             if node.transport == "h2" {
-                let config = tls_server_config(&node)?;
+                let mut config = tls_server_config(&node)?;
+                config.alpn_protocols = vec![b"h2".to_vec()];
                 let server = TlsServer::new(&addr, config, handler).await?;
                 let server_cancel = server.cancel_token();
                 let cancel_clone = cancel.clone();

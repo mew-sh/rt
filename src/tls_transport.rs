@@ -36,6 +36,32 @@ where
     Ok(connector.connect(domain, stream).await?)
 }
 
+/// Wrap a stream in TLS, negotiating ALPN.
+///
+/// gost's HTTP/2 listeners advertise `h2` (http2.go:594-627, 681-707), and a
+/// peer that does not offer it in the handshake will not be given an HTTP/2
+/// connection. Only the HTTP/2 transports need this, so it is separate from
+/// [`tls_connect_stream`].
+pub async fn tls_connect_stream_alpn<S>(
+    stream: S,
+    domain: &str,
+    insecure: bool,
+    alpn: &[&str],
+) -> Result<TlsStream<S>, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let mut builder = NativeTlsConnector::builder();
+    if insecure {
+        builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    }
+    builder.request_alpns(alpn);
+    let connector = TlsConnector::from(builder.build()?);
+    Ok(connector.connect(domain, stream).await?)
+}
+
 /// Create a TLS connector that skips verification (insecure).
 ///
 /// This is gost's default for a chain node: `InsecureSkipVerify` is set unless
