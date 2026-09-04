@@ -62,7 +62,7 @@ pub use handler::{Handler, HandlerOptions};
 pub use hosts::{Host, Hosts};
 pub use http2_transport::{Http2Connector, Http2Handler, Http2Transporter};
 pub use http_proxy::{HttpConnector, HttpHandler};
-pub use kcp::{KcpConfig, KcpTransporter};
+pub use kcp::{kcp_connect, Crypt, KcpConfig, KcpListener, KcpStream, KcpTransporter, SnappyStream};
 pub use mux::{MuxFrame, MuxSession};
 pub use mux_transport::{
     mux_config_from_node, mux_config_from_values, MuxDialer, MuxDialerPool, MuxHandler, MuxServer,

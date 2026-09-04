@@ -25,6 +25,11 @@ pub struct Chain {
     /// Live QUIC connections, keyed by hop, for the same reason as the smux
     /// pool: one connection per node, a stream per dial.
     quic_transporters: std::sync::Arc<QuicTransporterPool>,
+    /// One authenticated SSH session per hop, carrying many channels.
+    ssh_transporters: std::sync::Arc<SshTransporterPool>,
+    /// One KCP session per hop, with a stream per dial (gost's
+    /// `kcpTransporter.sessions` map).
+    kcp_transporters: std::sync::Arc<KcpTransporterPool>,
     node_groups: Vec<NodeGroup>,
     is_route: bool,
 }
@@ -41,6 +46,8 @@ impl Chain {
             resolver: None,
             mux_dialers: std::sync::Arc::new(crate::mux_transport::MuxDialerPool::new()),
             quic_transporters: std::sync::Arc::new(QuicTransporterPool::default()),
+            ssh_transporters: std::sync::Arc::new(SshTransporterPool::default()),
+            kcp_transporters: std::sync::Arc::new(KcpTransporterPool::default()),
             node_groups,
             is_route: false,
         }
@@ -56,6 +63,8 @@ impl Chain {
             resolver: None,
             mux_dialers: std::sync::Arc::new(crate::mux_transport::MuxDialerPool::new()),
             quic_transporters: std::sync::Arc::new(QuicTransporterPool::default()),
+            ssh_transporters: std::sync::Arc::new(SshTransporterPool::default()),
+            kcp_transporters: std::sync::Arc::new(KcpTransporterPool::default()),
             node_groups: Vec::new(),
             is_route: false,
         }
@@ -187,6 +196,12 @@ impl Chain {
             self.dial_mux_hop(first, timeout).await?
         } else if first.transport == "quic" {
             self.dial_quic_hop(first).await?
+        } else if first.transport == "kcp" {
+            self.dial_kcp_hop(first).await?
+        } else if first.transport == "ssh" {
+            // An SSH hop owns its dial for the same reason as mux and QUIC:
+            // one authenticated session carries many channels.
+            return self.dial_ssh_hop(first, hop_target(0), timeout).await;
         } else {
             let conn = self.connect_tcp(&first.addr, timeout).await?;
             layer_transport(ProxyConn::from_tcp(conn), first).await?
@@ -198,7 +213,11 @@ impl Chain {
         // connector — gost's Dial -> Handshake -> Connect order
         // (chain.go:286-319).
         for (i, node) in nodes.iter().enumerate().skip(1) {
-            if is_mux_transport(&node.transport) || node.transport == "quic" {
+            if is_mux_transport(&node.transport)
+                || node.transport == "quic"
+                || node.transport == "ssh"
+                || node.transport == "kcp"
+            {
                 // Reaching it would mean building a session over the previous
                 // hop's connection, and a session per dial defeats the point.
                 // gost dials such a hop through a sub-chain; not implemented.
@@ -288,6 +307,59 @@ impl Chain {
             rx: tokio::sync::Mutex::new(in_rx),
             _pump: DropGuard(vec![writer, reader]),
         })
+    }
+
+    /// Opens a stream on this hop's KCP session, establishing it the first
+    /// time. Like mux, QUIC and SSH, a KCP hop owns its dial because one
+    /// session carries many streams.
+    async fn dial_kcp_hop(&self, node: &Node) -> Result<ProxyConn, ChainError> {
+        let config = crate::kcp::KcpConfig::from_node(node)
+            .map_err(|e| ChainError::ProxyError(e.to_string()))?;
+        let transporter = self
+            .kcp_transporters
+            .get_or_create(&format!("kcp|{}", node.addr), config)?;
+
+        let stream = transporter
+            .dial(&node.addr)
+            .await
+            .map_err(|e| ChainError::ProxyError(format!("kcp hop failed: {}", e)))?;
+        Ok(ProxyConn::layered(Box::new(stream), None, None))
+    }
+
+    /// Opens a channel on this hop's SSH session, establishing and
+    /// authenticating the session the first time.
+    ///
+    /// gost pairs `direct`/`remote`+ssh with its SSH forward transporter
+    /// (route.go:203-208): the hop is the endpoint, so the channel it opens
+    /// already reaches `target` and no further protocol connector runs.
+    async fn dial_ssh_hop(
+        &self,
+        node: &Node,
+        target: &str,
+        timeout: Duration,
+    ) -> Result<ProxyConn, ChainError> {
+        let transporter = self.ssh_transporters.get_or_create(
+            &format!("ssh|{}", node.addr),
+            crate::ssh::SshConfig::from_node(node),
+        )?;
+
+        let addr = node.addr.clone();
+        let session = transporter
+            .session_over(&node.addr, || async move {
+                tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr))
+                    .await
+                    .map_err(|_| {
+                        crate::ssh::SshError::Config(format!("timed out connecting to {}", addr))
+                    })?
+                    .map_err(|e| crate::ssh::SshError::Config(e.to_string()))
+            })
+            .await
+            .map_err(|e| ChainError::ProxyError(format!("ssh hop failed: {}", e)))?;
+
+        session
+            .connect(target)
+            .await
+            .map_err(|e| ChainError::ProxyError(format!("ssh channel to {} failed: {}", target, e)))
     }
 
     /// Opens a stream on this hop's QUIC connection, establishing the
@@ -641,6 +713,87 @@ impl QuicTransporterPool {
         }
         let created = std::sync::Arc::new(
             crate::quic_transport::QuicTransporter::new(config)
+                .map_err(|e| ChainError::ProxyError(e.to_string()))?,
+        );
+        map.insert(key.to_string(), created.clone());
+        Ok(created)
+    }
+}
+
+/// One `KcpTransporter` per hop configuration.
+#[derive(Default)]
+pub struct KcpTransporterPool {
+    inner: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<crate::kcp::KcpTransporter>>,
+    >,
+}
+
+impl std::fmt::Debug for KcpTransporterPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<String> = match self.inner.lock() {
+            Ok(m) => m.keys().cloned().collect(),
+            Err(p) => p.into_inner().keys().cloned().collect(),
+        };
+        f.debug_struct("KcpTransporterPool")
+            .field("nodes", &keys)
+            .finish()
+    }
+}
+
+impl KcpTransporterPool {
+    fn get_or_create(
+        &self,
+        key: &str,
+        config: crate::kcp::KcpConfig,
+    ) -> Result<std::sync::Arc<crate::kcp::KcpTransporter>, ChainError> {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = map.get(key) {
+            return Ok(existing.clone());
+        }
+        let created = std::sync::Arc::new(
+            crate::kcp::KcpTransporter::new(config)
+                .map_err(|e| ChainError::ProxyError(e.to_string()))?,
+        );
+        map.insert(key.to_string(), created.clone());
+        Ok(created)
+    }
+}
+
+/// One `SshForwardTransporter` per hop, so a node's authenticated session is
+/// reused across dials rather than rebuilt per connection.
+#[derive(Default)]
+pub struct SshTransporterPool {
+    inner: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<crate::ssh::SshForwardTransporter>>,
+    >,
+}
+
+impl std::fmt::Debug for SshTransporterPool {
+    // Hand-written because a transporter holds live sessions, which are not
+    // Debug, and `Chain` derives Debug.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<String> = match self.inner.lock() {
+            Ok(m) => m.keys().cloned().collect(),
+            Err(p) => p.into_inner().keys().cloned().collect(),
+        };
+        f.debug_struct("SshTransporterPool")
+            .field("nodes", &keys)
+            .finish()
+    }
+}
+
+impl SshTransporterPool {
+    fn get_or_create(
+        &self,
+        key: &str,
+        config: crate::ssh::SshConfig,
+    ) -> Result<std::sync::Arc<crate::ssh::SshForwardTransporter>, ChainError> {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = map.get(key) {
+            return Ok(existing.clone());
+        }
+        let created = std::sync::Arc::new(
+            crate::ssh::SshForwardTransporter::new(config)
                 .map_err(|e| ChainError::ProxyError(e.to_string()))?,
         );
         map.insert(key.to_string(), created.clone());

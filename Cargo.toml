@@ -31,8 +31,6 @@ http = "1"
 httparse = "1"
 url = "2"
 pin-project-lite = "0.2"
-# SSH support (russh used internally by ssh module)
-# russh = "0.49" -- available but not imported directly yet
 # QUIC support
 quinn = "0.11"
 # The TLS listener uses rustls rather than native-tls: it is pure Rust, so the
@@ -52,6 +50,49 @@ md5 = "0.7"
 bytes = "1"
 rcgen = "0.13"
 openssl = { version = "0.10", features = ["vendored"], optional = true }
+# SSH transport and port forwarding.
+#
+# 0.63 rather than the 0.49 that was pencilled in: 0.49 predates the
+# `run_stream`/`connect_stream` entry points this crate needs to run SSH over an
+# already-accepted `ProxyConn` rather than over a socket russh opens itself.
+#
+# `default-features = false` drops aws-lc-rs in favour of ring. Both would
+# otherwise be in the tree at once (see the rustls note above), and aws-lc-rs
+# additionally needs NASM and cmake to build on Windows.
+#
+# `ssh-key` is not listed separately on purpose: russh pins it to an exact
+# pre-release (`=0.7.0-rc.11`) and re-exports it as `russh::keys::ssh_key`, so a
+# second entry here would resolve to a different, incompatible copy of the key
+# types that appear in russh's own trait signatures.
+russh = { version = "0.63", default-features = false, features = ["ring", "rsa"] }
+# KCP transport.
+#
+# `kcp` supplies only the ARQ core (the 24-byte segment header and the
+# retransmission state machine), which is byte-identical to xtaci/kcp-go's --
+# both are ports of skywind3000/ikcp.c. Everything kcp-go wraps around it lives
+# in src/kcp.rs: the 20-byte nonce+CRC32 crypt header, the CFB-over-a-fixed-IV
+# block mode, the FEC header, and the snappy framing.
+kcp = "0.6"
+# snappy for the `nocomp=false` compression layer. Only the raw block codec is
+# used; the stream framing is in src/kcp.rs because it has to be driven
+# asynchronously.
+snap = "1"
+# PBKDF2-HMAC-SHA1, kcp-go's session-key derivation (4096 rounds, 32 bytes).
+# 0.12 rather than 0.13 so it shares the sha1 0.10 / hmac 0.12 generation
+# already in the tree rather than pulling a second one.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+# kcp-go's block ciphers. These are the cipher 0.5 generation, which russh
+# already brings in, so only the small per-algorithm crates are new. Only the
+# *encryption* direction of each is used: kcp-go's mode is CFB, which encrypts
+# in both directions.
+cipher = "0.5"
+aes = "0.9"
+blowfish = "0.10"
+twofish = "0.8"
+cast5 = "0.12"
+des = "0.9"
+sm4 = "0.6"
+salsa20 = "0.11"
 
 [features]
 default = []

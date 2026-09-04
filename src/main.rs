@@ -345,13 +345,21 @@ fn load_secrets_file(path: &str) -> Result<LocalAuthenticator, std::io::Error> {
 /// between a listener and the handler dispatch, so accepting them would serve
 /// plaintext TCP under an encrypted-looking scheme.
 const SUPPORTED_LISTENER_TRANSPORTS: &[&str] = &[
-    "tcp", "tls", "ws", "wss", "mtls", "mws", "mwss", "quic", "udp", "rtcp", "rudp", "dns", "redu",
+    "tcp", "tls", "ws", "wss", "mtls", "mws", "mwss", "quic", "kcp", "udp", "rtcp", "rudp", "dns",
+    "redu",
 ];
 
 fn ensure_listener_transport_supported(
     node: &Node,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let transport = node.transport.as_str();
+    // `ssh` is only a listener transport for gost's `forward` protocol. Letting
+    // it through unconditionally would give `-L http+ssh://` a plain TCP
+    // listener, which is the hole this gate exists to close.
+    if transport == "ssh" {
+        ssh::ssh_listener_support(&node.protocol)?;
+        return Ok(());
+    }
     if transport.is_empty() || SUPPORTED_LISTENER_TRANSPORTS.contains(&transport) {
         return Ok(());
     }
@@ -365,9 +373,15 @@ fn ensure_listener_transport_supported(
 
 fn ensure_chain_transport_supported(node: &Node) -> Result<(), Box<dyn std::error::Error>> {
     let transport = node.transport.as_str();
+    // Same reasoning as the listener gate: `ssh` is only a chain transport for
+    // gost's direct/remote/forward protocols, not a general tunnel.
+    if transport == "ssh" {
+        ssh::ssh_chain_support(&node.protocol)?;
+        return Ok(());
+    }
     if matches!(
         transport,
-        "" | "tcp" | "tls" | "ws" | "wss" | "mtls" | "mws" | "mwss" | "quic"
+        "" | "tcp" | "tls" | "ws" | "wss" | "mtls" | "mws" | "mwss" | "quic" | "kcp"
     ) {
         return Ok(());
     }
@@ -463,7 +477,7 @@ async fn run_server(
         "dns" | "dot" | "doh" => serve!(DnsHandler::new(&remote, handler_opts)),
         "red" | "redirect" => serve!(TcpRedirectHandler::new(handler_opts), true),
         "redu" | "redirectu" => serve!(redirect::UdpRedirectHandler::new(handler_opts)),
-        "forward" => serve!(SshForwardHandler::new(handler_opts, SshConfig::default())),
+        "forward" => serve!(SshForwardHandler::new(handler_opts, SshConfig::from_node(&node))?),
         _ => {
             if !remote.is_empty() {
                 serve!(TcpDirectForwardHandler::new(&remote, handler_opts))
@@ -480,7 +494,11 @@ async fn run_server(
     match node.transport.as_str() {
         // `rudp` and `redu` still ride the TCP listener; they need the UDP
         // remote-forward and tproxy paths, which are not implemented yet.
-        "" | "tcp" | "rtcp" | "rudp" | "dns" | "redu" => {
+        //
+        // `forward+ssh` is a plain TCP listener in gost too (route.go:458-462):
+        // the SSH server handshake happens per connection inside the handler,
+        // which is also where authentication is enforced.
+        "" | "tcp" | "ssh" | "rtcp" | "rudp" | "dns" | "redu" => {
             let server = Server::new(&addr, handler)
                 .await?
                 .with_original_dst(capture_original_dst);
@@ -495,6 +513,19 @@ async fn run_server(
         "tls" => {
             let config = tls_server_config(&node)?;
             let server = TlsServer::new(&addr, config, handler).await?;
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
+        // KCP is a reliable protocol over UDP with smux on top, so like the
+        // multiplexed transports one session yields many handler calls.
+        "kcp" => {
+            let config = kcp::KcpConfig::from_node(&node)?;
+            let server = KcpListener::new(&addr, config, handler).await?;
             let server_cancel = server.cancel_token();
             let cancel_clone = cancel.clone();
             tokio::spawn(async move {
