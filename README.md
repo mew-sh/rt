@@ -1385,54 +1385,60 @@ Shell scripts in the `examples/` directory demonstrate each major feature with r
 
 ## 26. Implementation Status
 
-The table below summarizes the implementation depth of each gost feature in rustun.
+This table records the honest state of each gost feature in rustun, audited
+module by module against ginuerzh/gost. It is deliberately conservative: a row
+says **Working** only when the feature is reachable from the command line and
+covered by tests, not merely when the types exist.
 
-**Full**: Handler, connector, and CLI wiring are all implemented with end-to-end integration tests.
-**Handler only**: The handler/connector types exist and function, but the transport-level protocol (e.g., the actual KCP/QUIC/SSH wire protocol) delegates to a library crate or is stubbed.
-**Types only**: Configuration types, parsing, and platform-specific commands are implemented, but no runtime device creation or wire protocol is present.
+**Working**: reachable from the CLI and covered by tests.
+**Partial**: works for the common case, with the named gap.
+**Types only**: types and config parsing exist but nothing is wired to the CLI.
+**Absent**: not implemented.
+
+Transports marked *Types only* are **rejected at startup** rather than served as
+plaintext TCP. Earlier versions bound a plain TCP listener for `-L http+tls://`,
+reporting success while accepting unencrypted traffic.
 
 | gost Feature | rustun Status | Notes |
 |--------------|---------------|-------|
-| HTTP proxy (CONNECT + forward) | Full | Tested end-to-end with auth, bypass, blacklist |
-| SOCKS5 proxy | Full | CONNECT, UDP ASSOCIATE, user/pass auth, IPv4/IPv6/domain |
-| SOCKS4/4a proxy | Full | IPv4 and domain (4a) tested end-to-end |
-| Auto-detect handler | Full | Detects HTTP/SOCKS4/SOCKS5 from first byte |
-| Proxy chain (multi-hop) | Full | HTTP CONNECT and SOCKS5 chaining tested |
-| TCP direct forwarding | Full | Multi-target load balancing |
-| UDP direct forwarding | Full | TCP-to-UDP relay |
-| TCP remote forwarding | Full | Reverse tunnel tested end-to-end |
-| Relay protocol | Full | Auth features, address features, TCP tested |
-| Shadowsocks | Full | Plain cipher tested; AES-GCM/ChaCha20 key derivation implemented |
-| SNI proxy | Full | TLS ClientHello parsing, HTTP fallback |
-| DNS proxy | Full | TCP-to-UDP query forwarding |
-| HTTP/2 transport | Handler only | Delegates to HTTP/1.1 CONNECT; h2 crate types present |
-| SSH tunneling | Handler only | Handler and transporter types; russh crate not wired |
-| WebSocket transport | Handler only | WS/WSS transporter and handler; binary relay implemented |
-| Obfuscation (HTTP) | Full | Client/server handshake tested end-to-end |
-| Obfuscation (TLS) | Full | Fake ClientHello/ServerHello tested end-to-end |
-| Obfuscation (obfs4) | Types only | Type stubs; requires obfs4 pluggable transport |
-| KCP transport | Types only | Full config with JSON parsing and mode presets |
-| QUIC transport | Types only | QuicConfig, transporter, listener types; quinn crate present |
-| TLS client | Full | Insecure and default connectors |
-| TLS server | Handler only | TlsAcceptor wired; handler dispatch pending generalization |
-| Transparent proxy (TCP) | Full on Linux | SO_ORIGINAL_DST; error on other platforms |
-| Transparent proxy (UDP) | Stub | Requires tproxy integration |
-| TUN device | Types + platform commands | Config parsing, route commands (Linux/macOS/Windows/Unix) |
-| TAP device | Types + platform commands | Config parsing, route commands (not macOS) |
-| FakeTCP | Types only | Requires raw socket access |
-| VSOCK | Types only | Address parsing; requires vsock crate on Linux |
-| Multiplexing (smux) | Types only | MuxFrame encode/decode; MuxSession lifecycle |
-| Live reload | Full | Reloader/Stoppable traits; period_reload file watcher |
-| Authentication | Full | Inline credentials, secrets file, LocalAuthenticator reload |
-| Bypass | Full | IP/CIDR/Domain matchers, reversed mode, reload |
-| Permissions | Full | Whitelist/blacklist with action:host:port rules |
-| Load balancing | Full | Round-robin, random, FIFO; FailFilter, InvalidFilter |
-| Socket mark | Full on Linux | SO_MARK; no-op on other platforms |
-| Interface bind | Full on Linux | SO_BINDTODEVICE; no-op on other platforms |
-| Signal handling | Full on Unix | SIGUSR1; no-op on Windows |
-| Configuration file | Full | JSON format compatible with gost |
-
----
+| HTTP proxy (CONNECT + forward) | Working | Auth, bypass, whitelist/blacklist; request bodies preserved; origin-form forwarding |
+| HTTP probe_resist / knock | Absent | None of the web/host/file/code modes |
+| SOCKS5 CONNECT | Working | User/pass auth, IPv4/IPv6/domain, all-zero bound address in the reply |
+| SOCKS5 UDP ASSOCIATE | Working | Real relay socket, per-datagram ACL, fragments dropped, torn down with the control connection |
+| SOCKS5 BIND | Working | Two-reply sequence |
+| SOCKS5 gost extensions | Absent | MethodTLS 0x80, MethodTLSAuth 0x82, CmdMuxBind 0xF2, CmdUDPTun 0xF3 |
+| SOCKS4/4a proxy | Working | CONNECT and BIND |
+| Auto-detect handler | Working | Refuses SOCKS4 when credentials are configured, as gost does |
+| Proxy chain (multi-hop) | Partial | HTTP/SOCKS4/SOCKS4a/SOCKS5 connectors with authentication; unknown protocols are a hard error. No transport layer mid-chain |
+| Shadowsocks (TCP) | Working | Real AEAD: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305. Unknown ciphers fail closed |
+| Shadowsocks over UDP (`ssu`) | Absent | Rejected at startup; needs the UDP listener |
+| Relay protocol | Working | Wire-compatible header, UDP length framing, lazy handshake |
+| TCP direct/remote forwarding | Working | Multi-target with a fail-filter selector |
+| UDP direct forwarding | Partial | Does not route through the chain; no idle expiry |
+| UDP remote forwarding (`rudp`) | Absent | Needs the UDP listener |
+| DNS proxy | Working | udp, tcp, tls and https modes; multi-upstream with failover |
+| DNS resolver | Working | udp/tcp/DoT/DoH nameservers, cache with TTL, prefer ipv4/ipv6, EDNS0 client subnet. DoT not covered end to end |
+| Hosts file | Working | Exact-match, as in gost v2; live reload |
+| SNI proxy | Partial | Server side only; the client connector and the 0xFFFE host extension are absent |
+| Transparent proxy (TCP) | Working on Linux | SO_ORIGINAL_DST |
+| Transparent proxy (UDP) | Absent | Needs tproxy |
+| Authentication | Working | Inline credentials and secrets file, with live reload |
+| Bypass / permissions | Working | go-glob semantics for permissions, IPv6-correct, fails closed |
+| Load balancing | Working | round/random/fifo with FailFilter and InvalidFilter. FastestFilter absent |
+| Live reload | Working | Driven for secrets, bypass, hosts and dns |
+| Configuration file | Working | gost v2 JSON format |
+| TLS / mTLS transport | Types only | Rejected at startup |
+| WS / WSS / MWS / MWSS transport | Types only | Rejected at startup; the default path also differs from gost |
+| KCP transport | Types only | Config parsing only; no KCP crate |
+| QUIC transport | Types only | quinn present but no accept loop and no ALPN |
+| HTTP/2, h2, h2c transport | Types only | The `http2` handler falls back to HTTP/1.1, which gost cannot speak |
+| Obfuscation (ohttp / otls) | Types only | Handshake only; otls has no record framing |
+| Obfuscation (obfs4) | Absent | Dropped in go-gost v3 as well |
+| SSH tunnelling | Types only | Rejected at startup; russh is not wired |
+| Multiplexing (smux) | Absent | The existing frame layout is not smux-compatible |
+| TUN / TAP | Types only | Configures an existing interface; no device creation or packet loop |
+| FakeTCP, VSOCK | Types only | Need raw sockets and a vsock crate |
+| Socket mark / interface bind | Partial | Correct Linux implementations, not yet applied to outbound sockets |
 
 ## 27. Module Reference
 
