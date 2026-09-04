@@ -69,11 +69,6 @@ docker run --rm -p 8080:8080 ghcr.io/mew-sh/rt:2.0.0 -L http://:8080
 
 Tags are `2.0.0`, `2.0` and `latest`.
 
-> GHCR creates new packages as **private**, even for a public repository, so an
-> anonymous `docker pull` returns `denied` until the package visibility is
-> switched to public once under Packages -> rt -> Package settings. Until then,
-> pull with `docker login ghcr.io`.
-
 ### From Source
 
 ```bash
@@ -1407,11 +1402,6 @@ Releases push an image to GitHub Container Registry, tagged `2.0.0`, `2.0` and
 ```bash
 docker pull ghcr.io/mew-sh/rt:2.0.0
 ```
-
-> GHCR creates new packages as **private**, even for a public repository, so an
-> anonymous `docker pull` returns `denied` until the package visibility is
-> switched to public once under Packages -> rt -> Package settings. Until then,
-> pull with `docker login ghcr.io`.
 
 ### Building the Docker Image
 
