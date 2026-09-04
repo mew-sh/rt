@@ -1,5 +1,5 @@
 # ============================================================================
-# docker-compose.yml -- Example deployment topologies for rustun
+# docker-compose.yml -- Example deployment topologies for rt
 #
 # Usage:
 #   docker compose up -d                 # start all services
@@ -119,10 +119,10 @@ services:
   # --------------------------------------------------------------------------
   multi-listener:
     build: .
-    command: ["-C", "/etc/rustun/config.json", "-D"]
+    command: ["-C", "/etc/rt/config.json", "-D"]
     ports:
       - "18080:8080"
       - "11080:1080"
     volumes:
-      - ./examples/config.json:/etc/rustun/config.json:ro
+      - ./examples/config.json:/etc/rt/config.json:ro
     restart: unless-stopped

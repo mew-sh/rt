@@ -10,7 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: rustun
+  BINARY_NAME: rt
 
 jobs:
   # --------------------------------------------------------------------------

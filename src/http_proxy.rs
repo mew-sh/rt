@@ -869,7 +869,7 @@ Host: {}
     #[tokio::test]
     async fn test_probe_resist_file_serves_a_decoy_page() {
         let dir = std::env::temp_dir();
-        let path = dir.join("rustun_probe_resist_decoy.html");
+        let path = dir.join("rt_probe_resist_decoy.html");
         tokio::fs::write(&path, b"<html>decoy</html>").await.unwrap();
 
         let spec = format!("file:{}", path.display());

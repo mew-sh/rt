@@ -107,4 +107,4 @@ pub const CONNECT_TIMEOUT: u64 = 5;
 pub const READ_TIMEOUT: u64 = 10;
 pub const WRITE_TIMEOUT: u64 = 10;
 pub const DEFAULT_USER_AGENT: &str = "Chrome/78.0.3904.106";
-pub const DEFAULT_PROXY_AGENT: &str = "rustun/0.1.0";
+pub const DEFAULT_PROXY_AGENT: &str = "rt/0.1.0";

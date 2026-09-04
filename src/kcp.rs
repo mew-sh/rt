@@ -93,7 +93,7 @@ pub const KCP_SALT: &str = "kcp-go";
 
 /// gost's `DefaultKCPConfig.Key` (kcp.go:83), typo and all. A `kcp://` node
 /// with no `?c=` config file uses it on both ends, so it is what an
-/// unconfigured rustun and an unconfigured gost agree on.
+/// unconfigured rt and an unconfigured gost agree on.
 pub const DEFAULT_KEY: &str = "it's a secrect";
 
 /// PBKDF2 rounds and key length for the session key (kcp.go:415).
@@ -624,7 +624,7 @@ impl Crypt {
     /// would.
     ///
     /// Unknown names fall through to aes, as in gost, rather than being
-    /// refused: gost accepts them, and refusing would make rustun the odd one
+    /// refused: gost accepts them, and refusing would make rt the odd one
     /// out. It is logged, because a typo in `crypt` silently changing the
     /// algorithm is worth seeing.
     pub fn new(key: &str, crypt: &str, salt: &str) -> Result<Self, BoxError> {
@@ -850,7 +850,7 @@ fn fec_strip(data: &[u8]) -> Option<&[u8]> {
 /// Reed-Solomon parity shards are *not* generated. Data shards are framed and
 /// numbered exactly as kcp-go numbers them, and parity shards arriving from a
 /// peer are recognised and discarded, so the wire format is honoured in both
-/// directions — but a peer receiving from rustun gets no erasure coding and
+/// directions — but a peer receiving from rt gets no erasure coding and
 /// falls back to KCP's own retransmission for lost packets.
 ///
 /// This is visible on a kcp-go peer only as its FEC decoder detecting that the
@@ -2630,7 +2630,7 @@ mod tests {
         let origin = spawn_origin().await;
 
         // The stock configuration on both sides. `?c=` is left off so gost
-        // uses `DefaultKCPConfig` and rustun uses `KcpConfig::default`, which
+        // uses `DefaultKCPConfig` and rt uses `KcpConfig::default`, which
         // is the pairing an operator gets by typing `kcp://host:port`.
         interop_round(&gost, KcpConfig::default(), None, origin, "defaults").await;
 
@@ -2638,7 +2638,7 @@ mod tests {
         // different key, a different cipher family (a stream cipher rather
         // than a block one), no compression and no FEC framing. Passed to
         // gost as the JSON `?c=` file it reads, serialised from the very
-        // struct rustun runs on.
+        // struct rt runs on.
         let mut config = KcpConfig::default();
         config.key = "interop-shared-secret".to_string();
         config.crypt = "salsa20".to_string();
@@ -2649,7 +2649,7 @@ mod tests {
         config.mtu = 1200;
         config.init();
 
-        let path = std::env::temp_dir().join("rustun-kcp-interop.json");
+        let path = std::env::temp_dir().join("rt-kcp-interop.json");
         std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
         let query = format!("?c={}", path.display());
         interop_round(&gost, config, Some(&query), origin, "salsa20/nocomp/nofec").await;
@@ -2665,7 +2665,7 @@ mod tests {
     ) {
         let query = query.unwrap_or("");
 
-        // Direction 1: rustun dials a gost KCP server.
+        // Direction 1: rt dials a gost KCP server.
         {
             let port = free_port();
             let node = format!("kcp://127.0.0.1:{}{}", port, query);
@@ -2680,7 +2680,7 @@ mod tests {
             let body = http_get_through_proxy(&mut stream, origin).await;
             assert!(
                 body.contains("INTEROP-OK"),
-                "[{}] rustun client -> gost server returned: {:?}",
+                "[{}] rt client -> gost server returned: {:?}",
                 label,
                 body
             );
@@ -2701,13 +2701,13 @@ mod tests {
                 label
             );
             eprintln!(
-                "  PASS  {}  rustun client -> gost server (probe + {} KiB)",
+                "  PASS  {}  rt client -> gost server (probe + {} KiB)",
                 label,
                 BIG_LEN / 1024
             );
         }
 
-        // Direction 2: gost dials a rustun KCP server.
+        // Direction 2: gost dials an rt KCP server.
         {
             let listener = KcpListener::new(
                 "127.0.0.1:0",
@@ -2745,7 +2745,7 @@ mod tests {
             let body = http_get_through_proxy(&mut stream, origin).await;
             assert!(
                 body.contains("INTEROP-OK"),
-                "[{}] gost client -> rustun server returned: {:?}",
+                "[{}] gost client -> rt server returned: {:?}",
                 label,
                 body
             );
@@ -2764,7 +2764,7 @@ mod tests {
                 label
             );
             eprintln!(
-                "  PASS  {}  gost client -> rustun server (probe + {} KiB)",
+                "  PASS  {}  gost client -> rt server (probe + {} KiB)",
                 label,
                 BIG_LEN / 1024
             );

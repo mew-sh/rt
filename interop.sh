@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Interoperability harness: rustun against the real gost 2.12.0 binary.
+# Interoperability harness: rt against the real gost 2.12.0 binary.
 #
 # For each scheme, runs BOTH directions:
-#   rustun client -> gost server
-#   gost client   -> rustun server
+#   rt client -> gost server
+#   gost client   -> rt server
 #
 # A "client" here is a plain http:// listener chained to the peer with -F, so a
 # single curl through it exercises the whole path.
 
 GOST=/tmp/gost.exe
-RUSTUN=./target/release/rustun.exe
+RT=./target/release/rt.exe
 TARGET_PORT=21000
 BASE=21100
 PIDS=()
@@ -50,21 +50,21 @@ case_both() {
   local scheme="$1"
   local sp=$((BASE++)) cp=$((BASE++))
 
-  # Direction 1: rustun dials a gost server.
+  # Direction 1: rt dials a gost server.
   spawn "$GOST" -L "$scheme://127.0.0.1:$sp"
   sleep 2
-  spawn "$RUSTUN" -L "http://127.0.0.1:$cp" -F "$scheme://127.0.0.1:$sp"
-  try "$scheme  rustun client -> gost server" "$cp"
+  spawn "$RT" -L "http://127.0.0.1:$cp" -F "$scheme://127.0.0.1:$sp"
+  try "$scheme  rt client -> gost server" "$cp"
 
   local sp2=$((BASE++)) cp2=$((BASE++))
-  # Direction 2: gost dials a rustun server.
-  spawn "$RUSTUN" -L "$scheme://127.0.0.1:$sp2"
+  # Direction 2: gost dials an rt server.
+  spawn "$RT" -L "$scheme://127.0.0.1:$sp2"
   sleep 2
   spawn "$GOST" -L "http://127.0.0.1:$cp2" -F "$scheme://127.0.0.1:$sp2"
-  try "$scheme  gost client -> rustun server" "$cp2"
+  try "$scheme  gost client -> rt server" "$cp2"
 }
 
-echo "=== rustun <-> gost 2.12.0 interoperability ==="
+echo "=== rt <-> gost 2.12.0 interoperability ==="
 for s in "$@"; do
   echo "--- $s ---"
   case_both "$s"

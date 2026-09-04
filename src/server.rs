@@ -188,11 +188,11 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        client.write_all(b"hello rustun").await.unwrap();
+        client.write_all(b"hello rt").await.unwrap();
 
         let mut buf = vec![0u8; 1024];
         let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"hello rustun");
+        assert_eq!(&buf[..n], b"hello rt");
 
         // Graceful shutdown instead of abort
         cancel.cancel();

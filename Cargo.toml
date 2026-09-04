@@ -1,11 +1,11 @@
 [package]
-name = "rustun"
+name = "rt"
 version = "0.1.0"
 edition = "2021"
 description = "A multi-protocol security tunnel written in Rust, ported from gost"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/mew-sh/rustun"
+repository = "https://github.com/mew-sh/rt"
 keywords = ["proxy", "tunnel", "socks5", "http-proxy", "port-forwarding"]
 categories = ["network-programming", "command-line-utilities"]
 

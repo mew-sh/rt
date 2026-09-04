@@ -1349,7 +1349,7 @@ mod tests {
     fn temp_key_file(name: &str) -> (String, PrivateKey) {
         let key = generate_host_key().unwrap();
         let pem = key.to_openssh(russh::keys::ssh_key::LineEnding::LF).unwrap();
-        let path = std::env::temp_dir().join(format!("rustun-ssh-test-{}-{}", std::process::id(), name));
+        let path = std::env::temp_dir().join(format!("rt-ssh-test-{}-{}", std::process::id(), name));
         std::fs::write(&path, pem.as_bytes()).unwrap();
         (path.to_string_lossy().into_owned(), key)
     }
@@ -1472,7 +1472,7 @@ mod tests {
     fn test_forward_handler_accepts_authorized_keys_only() {
         let key = generate_host_key().unwrap();
         let path = std::env::temp_dir()
-            .join(format!("rustun-ssh-test-ak-{}", std::process::id()));
+            .join(format!("rt-ssh-test-ak-{}", std::process::id()));
         std::fs::write(&path, key.public_key().to_openssh().unwrap()).unwrap();
 
         let config = SshConfig {
@@ -1624,7 +1624,7 @@ mod tests {
     async fn test_public_key_auth_end_to_end() {
         let (key_path, key) = temp_key_file("pubkey-auth");
         let ak_path = std::env::temp_dir()
-            .join(format!("rustun-ssh-test-ak2-{}", std::process::id()));
+            .join(format!("rt-ssh-test-ak2-{}", std::process::id()));
         std::fs::write(&ak_path, key.public_key().to_openssh().unwrap()).unwrap();
 
         let (ssh_addr, target_addr) = start_forward_server(
@@ -1660,7 +1660,7 @@ mod tests {
         let (key_path, _) = temp_key_file("bad-pubkey");
         let authorized = generate_host_key().unwrap();
         let ak_path = std::env::temp_dir()
-            .join(format!("rustun-ssh-test-ak3-{}", std::process::id()));
+            .join(format!("rt-ssh-test-ak3-{}", std::process::id()));
         std::fs::write(&ak_path, authorized.public_key().to_openssh().unwrap()).unwrap();
 
         let (ssh_addr, _) = start_forward_server(
@@ -1716,7 +1716,7 @@ mod tests {
         // hand the password to whoever answered.
         let other = generate_host_key().unwrap();
         let pin_path = std::env::temp_dir()
-            .join(format!("rustun-ssh-test-pin-{}", std::process::id()));
+            .join(format!("rt-ssh-test-pin-{}", std::process::id()));
         std::fs::write(&pin_path, other.public_key().to_openssh().unwrap()).unwrap();
 
         let client = SshForwardTransporter::new(SshConfig {
@@ -1744,7 +1744,7 @@ mod tests {
         .await;
 
         let pin_path = std::env::temp_dir()
-            .join(format!("rustun-ssh-test-pin2-{}", std::process::id()));
+            .join(format!("rt-ssh-test-pin2-{}", std::process::id()));
         std::fs::write(&pin_path, key.public_key().to_openssh().unwrap()).unwrap();
 
         let client = SshForwardTransporter::new(SshConfig {
@@ -1849,7 +1849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_interop_rustun_client_to_gost_forward_ssh_server() {
+    async fn test_interop_rt_client_to_gost_forward_ssh_server() {
         let Some(gost) = gost_binary() else {
             eprintln!("skipping: no gost binary found");
             return;
@@ -1935,7 +1935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_interop_gost_client_to_rustun_forward_ssh_server() {
+    async fn test_interop_gost_client_to_rt_forward_ssh_server() {
         let Some(gost) = gost_binary() else {
             eprintln!("skipping: no gost binary found");
             return;
@@ -1970,7 +1970,7 @@ mod tests {
         let mut buf = [0u8; 14];
         tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut buf))
             .await
-            .expect("timed out reading through the gost -> rustun ssh forward")
+            .expect("timed out reading through the gost -> rt ssh forward")
             .expect("read failed");
         assert_eq!(&buf, b"SSH-FORWARD-OK");
     }

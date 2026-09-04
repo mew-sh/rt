@@ -310,7 +310,7 @@ fn platform_create_tun(cfg: &TunConfig) -> Result<String, std::io::Error> {
     use std::process::Command;
 
     let name = if cfg.name.is_empty() {
-        "rustun-tun"
+        "rt-tun"
     } else {
         &cfg.name
     };
@@ -351,7 +351,7 @@ fn platform_create_tap(cfg: &TapConfig) -> Result<String, std::io::Error> {
     use std::process::Command;
 
     let name = if cfg.name.is_empty() {
-        "rustun-tap"
+        "rt-tap"
     } else {
         &cfg.name
     };

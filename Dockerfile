@@ -1,5 +1,5 @@
 # ============================================================================
-# Multi-stage build for rustun
+# Multi-stage build for rt
 # ============================================================================
 # Stage 1: Build -- use latest stable Rust to avoid edition2024 issues
 # ============================================================================
@@ -10,7 +10,7 @@ RUN apt-get update && \
         pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/rustun
+WORKDIR /usr/src/rt
 
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
@@ -30,11 +30,11 @@ RUN apt-get update && \
         iptables \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/src/rustun/target/release/rustun /usr/local/bin/rustun
+COPY --from=builder /usr/src/rt/target/release/rt /usr/local/bin/rt
 
-RUN mkdir -p /etc/rustun
+RUN mkdir -p /etc/rt
 
 EXPOSE 8080 1080 8338 8443
 
-ENTRYPOINT ["rustun"]
+ENTRYPOINT ["rt"]
 CMD ["-L", ":8080"]

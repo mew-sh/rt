@@ -46,7 +46,7 @@ async fn platform_signal_handler() {
 
 /// Dump runtime diagnostics.  Called when SIGUSR1 is received on Unix.
 fn dump_diagnostics() {
-    info!("[diagnostics] rustun is running");
+    info!("[diagnostics] rt is running");
     // Future: dump KCP SNMP stats, connection counts, chain state, etc.
 }
 

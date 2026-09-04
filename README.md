@@ -1,8 +1,8 @@
-# rustun
+# rt
 
 A multi-protocol security tunnel written in Rust, ported from [gost](https://github.com/ginuerzh/gost) (GO Simple Tunnel).
 
-rustun provides a unified command-line interface for proxying, tunneling, and forwarding network traffic across a wide range of protocols. It supports listening on multiple ports simultaneously, multi-level proxy chaining, standard and extended proxy protocols, pluggable transport obfuscation, local and remote port forwarding, transparent proxying, DNS proxying, TUN/TAP device tunneling, authentication, access control, load balancing, and live configuration reload.
+rt provides a unified command-line interface for proxying, tunneling, and forwarding network traffic across a wide range of protocols. It supports listening on multiple ports simultaneously, multi-level proxy chaining, standard and extended proxy protocols, pluggable transport obfuscation, local and remote port forwarding, transparent proxying, DNS proxying, TUN/TAP device tunneling, authentication, access control, load balancing, and live configuration reload.
 
 ## Table of Contents
 
@@ -45,23 +45,23 @@ rustun provides a unified command-line interface for proxying, tunneling, and fo
 ### From Source
 
 ```bash
-git clone https://github.com/mew-sh/rustun
-cd rustun
+git clone https://github.com/mew-sh/rt
+cd rt
 cargo build --release
 ```
 
-The compiled binary is located at `target/release/rustun` (or `target/release/rustun.exe` on Windows).
+The compiled binary is located at `target/release/rt` (or `target/release/rt.exe` on Windows).
 
 ### Verify Installation
 
 ```bash
-rustun -V
+rt -V
 ```
 
 Output:
 
 ```
-rustun 0.1.0 (rustc windows/x86_64)
+rt 0.1.0 (rustc windows/x86_64)
 ```
 
 ---
@@ -70,36 +70,36 @@ rustun 0.1.0 (rustc windows/x86_64)
 
 ### No Forward Proxy
 
-The simplest usage is to start a standard proxy server. When no scheme is specified, rustun starts in auto-detection mode and determines the protocol (HTTP, SOCKS4, or SOCKS5) from the first byte of each incoming connection.
+The simplest usage is to start a standard proxy server. When no scheme is specified, rt starts in auto-detection mode and determines the protocol (HTTP, SOCKS4, or SOCKS5) from the first byte of each incoming connection.
 
 Start a standard HTTP/SOCKS5 auto-detecting proxy:
 
 ```bash
-rustun -L :8080
+rt -L :8080
 ```
 
 Start an explicit HTTP proxy:
 
 ```bash
-rustun -L http://:8080
+rt -L http://:8080
 ```
 
 Start an explicit SOCKS5 proxy:
 
 ```bash
-rustun -L socks5://:1080
+rt -L socks5://:1080
 ```
 
 Start a proxy with authentication:
 
 ```bash
-rustun -L admin:123456@localhost:8080
+rt -L admin:123456@localhost:8080
 ```
 
 Start multiple authentication credentials from a secrets file:
 
 ```bash
-rustun -L "localhost:8080?secrets=secrets.txt"
+rt -L "localhost:8080?secrets=secrets.txt"
 ```
 
 The `secrets.txt` file format is one `username password` pair per line. Lines beginning with `#` are treated as comments and ignored:
@@ -114,7 +114,7 @@ test002 12345678
 Listen on multiple ports simultaneously:
 
 ```bash
-rustun -L http2://:443 -L socks5://:1080 -L ss://aes-128-gcm:123456@:8338
+rt -L http2://:443 -L socks5://:1080 -L ss://aes-128-gcm:123456@:8338
 ```
 
 ### Forward Proxy
@@ -122,27 +122,27 @@ rustun -L http2://:443 -L socks5://:1080 -L ss://aes-128-gcm:123456@:8338
 Route traffic through an upstream proxy server:
 
 ```bash
-rustun -L :8080 -F 192.168.1.1:8081
+rt -L :8080 -F 192.168.1.1:8081
 ```
 
 Forward through a proxy with authentication:
 
 ```bash
-rustun -L :8080 -F http://admin:123456@192.168.1.1:8081
+rt -L :8080 -F http://admin:123456@192.168.1.1:8081
 ```
 
 ### Multi-Level Forward Proxy (Proxy Chain)
 
-Create a chain of proxy servers. rustun forwards each request through the chain in the order specified by the `-F` flags. Each proxy in the chain can use any supported protocol:
+Create a chain of proxy servers. rt forwards each request through the chain in the order specified by the `-F` flags. Each proxy in the chain can use any supported protocol:
 
 ```bash
-rustun -L :8080 -F quic://192.168.1.1:6121 -F socks5+wss://192.168.1.2:1080 -F http2://192.168.1.3:443
+rt -L :8080 -F quic://192.168.1.1:6121 -F socks5+wss://192.168.1.2:1080 -F http2://192.168.1.3:443
 ```
 
 In this example, the traffic path is:
 
 ```
-client -> rustun(:8080) -> quic(192.168.1.1:6121) -> socks5+wss(192.168.1.2:1080) -> http2(192.168.1.3:443) -> target
+client -> rt(:8080) -> quic(192.168.1.1:6121) -> socks5+wss(192.168.1.2:1080) -> http2(192.168.1.3:443) -> target
 ```
 
 ---
@@ -150,7 +150,7 @@ client -> rustun(:8080) -> quic(192.168.1.1:6121) -> socks5+wss(192.168.1.2:1080
 ## 3. Command Line Reference
 
 ```
-Usage: rustun [OPTIONS]
+Usage: rt [OPTIONS]
 
 Options:
   -L <LISTEN>       Listen address, can listen on multiple ports (required)
@@ -169,10 +169,10 @@ Options:
 Specifies one or more local listening addresses. Each `-L` flag starts an independent service. The address follows the node address format described in Section 4. At least one `-L` flag is required unless a configuration file is provided via `-C`.
 
 ```bash
-rustun -L http://:8080                        # HTTP proxy on port 8080
-rustun -L socks5://admin:pass@:1080           # SOCKS5 with authentication on port 1080
-rustun -L tcp://:2222/192.168.1.1:22          # TCP port forwarding, local 2222 to remote 22
-rustun -L http://:8080 -L socks5://:1080      # Two listeners simultaneously
+rt -L http://:8080                        # HTTP proxy on port 8080
+rt -L socks5://admin:pass@:1080           # SOCKS5 with authentication on port 1080
+rt -L tcp://:2222/192.168.1.1:22          # TCP port forwarding, local 2222 to remote 22
+rt -L http://:8080 -L socks5://:1080      # Two listeners simultaneously
 ```
 
 ### -F (Forward)
@@ -180,8 +180,8 @@ rustun -L http://:8080 -L socks5://:1080      # Two listeners simultaneously
 Specifies one or more upstream proxy nodes to form a forward chain. Each `-F` flag appends a node to the chain. When multiple `-F` flags are given, they form a multi-hop chain: the first `-F` is the entry proxy, the last `-F` is the exit proxy closest to the target.
 
 ```bash
-rustun -L :8080 -F http://proxy1:3128                           # Single-hop HTTP proxy chain
-rustun -L :8080 -F http://proxy1:3128 -F socks5://proxy2:1080   # Two-hop chain: HTTP then SOCKS5
+rt -L :8080 -F http://proxy1:3128                           # Single-hop HTTP proxy chain
+rt -L :8080 -F http://proxy1:3128 -F socks5://proxy2:1080   # Two-hop chain: HTTP then SOCKS5
 ```
 
 ### -M (Mark)
@@ -189,7 +189,7 @@ rustun -L :8080 -F http://proxy1:3128 -F socks5://proxy2:1080   # Two-hop chain:
 Sets the `SO_MARK` socket option on all outgoing connections. This integer value is used by the Linux kernel for policy-based routing (e.g., routing marked packets through specific interfaces or VPN tunnels via `ip rule` and `iptables`). Has no effect on platforms that do not support socket marks. Default value is `0` (no mark).
 
 ```bash
-rustun -L :8080 -M 100
+rt -L :8080 -M 100
 ```
 
 ### -C (Configure File)
@@ -197,7 +197,7 @@ rustun -L :8080 -M 100
 Loads configuration from a JSON file instead of (or in addition to) command-line flags. The JSON format is described in Section 5. When both `-C` and `-L`/`-F` flags are present, the configuration file takes precedence.
 
 ```bash
-rustun -C config.json
+rt -C config.json
 ```
 
 ### -I (Interface)
@@ -205,7 +205,7 @@ rustun -C config.json
 Binds all outgoing connections to the specified network interface name. This is useful on multi-homed hosts where traffic should exit through a particular interface. The value is an interface name such as `eth0`, `wlan0`, or `tun0`.
 
 ```bash
-rustun -L :8080 -I eth0
+rt -L :8080 -I eth0
 ```
 
 ### -D (Debug)
@@ -213,16 +213,16 @@ rustun -L :8080 -I eth0
 Enables debug-level logging. Without this flag, only informational messages and above are printed. With this flag, detailed per-connection diagnostics including protocol handshakes, address resolution, and data flow are logged.
 
 ```bash
-rustun -L :8080 -D
+rt -L :8080 -D
 ```
 
 ### -V (Version)
 
-Prints the version string and exits immediately. The output format is `rustun <version> (rustc <os>/<arch>)`, which mirrors the gost version output format `gost <version> (go<version> <os>/<arch>)`.
+Prints the version string and exits immediately. The output format is `rt <version> (rustc <os>/<arch>)`, which mirrors the gost version output format `gost <version> (go<version> <os>/<arch>)`.
 
 ```bash
-rustun -V
-# Output: rustun 0.1.0 (rustc windows/x86_64)
+rt -V
+# Output: rt 0.1.0 (rustc windows/x86_64)
 ```
 
 ### -P (Profiling)
@@ -230,12 +230,12 @@ rustun -V
 Specifies the address for a profiling HTTP server. This server is only started when the `PROFILING` environment variable is set to a non-empty value. Default address is `:6060`.
 
 ```bash
-PROFILING=1 rustun -L :8080 -P :6060
+PROFILING=1 rt -L :8080 -P :6060
 ```
 
 ### No Arguments
 
-When rustun is invoked with no arguments at all, it prints the usage help text and exits with code 0. This matches the behavior of gost.
+When rt is invoked with no arguments at all, it prints the usage help text and exits with code 0. This matches the behavior of gost.
 
 ---
 
@@ -411,7 +411,7 @@ The JSON configuration file provides the same capabilities as command-line flags
 
 ### Multiple Routes
 
-Each route operates independently: it has its own set of listeners (`ServeNodes`), its own proxy chain (`ChainNodes`), and its own connection parameters. This allows a single rustun instance to serve multiple proxy protocols on different ports with different upstream chains.
+Each route operates independently: it has its own set of listeners (`ServeNodes`), its own proxy chain (`ChainNodes`), and its own connection parameters. This allows a single rt instance to serve multiple proxy protocols on different ports with different upstream chains.
 
 ---
 
@@ -421,12 +421,12 @@ Each route operates independently: it has its own set of listeners (`ServeNodes`
 
 The HTTP proxy handler supports both the CONNECT method (for HTTPS tunneling) and direct HTTP request forwarding.
 
-When a client sends an HTTP CONNECT request, rustun establishes a TCP tunnel to the target and relays data bidirectionally. When a client sends a plain HTTP request (GET, POST, etc.), rustun forwards the request to the target server and streams the response back.
+When a client sends an HTTP CONNECT request, rt establishes a TCP tunnel to the target and relays data bidirectionally. When a client sends a plain HTTP request (GET, POST, etc.), rt forwards the request to the target server and streams the response back.
 
 Server:
 
 ```bash
-rustun -L http://:8080
+rt -L http://:8080
 ```
 
 The handler performs the following steps for CONNECT:
@@ -441,7 +441,7 @@ The handler performs the following steps for CONNECT:
 
 For plain HTTP requests, the handler forwards the request (stripping proxy-specific headers such as `Proxy-Connection` and `Proxy-Authorization`) to the target server and relays the response.
 
-The HTTP proxy sets the `Proxy-Agent` response header to `rustun/<version>` by default. This can be customized with the `proxyAgent` query parameter.
+The HTTP proxy sets the `Proxy-Agent` response header to `rt/<version>` by default. This can be customized with the `proxyAgent` query parameter.
 
 ### Probe Resistance
 
@@ -453,8 +453,8 @@ The HTTP proxy supports probe resistance to defend against active probing. When 
 - `file:<path>` -- Serve the content of the given file.
 
 ```bash
-rustun -L "http://user:pass@:8080?probe_resist=code:404"
-rustun -L "http://user:pass@:8080?probe_resist=web:example.com&knock=secret.example.com"
+rt -L "http://user:pass@:8080?probe_resist=code:404"
+rt -L "http://user:pass@:8080?probe_resist=web:example.com&knock=secret.example.com"
 ```
 
 The `knock` parameter specifies a knocking host. Only requests to this host bypass probe resistance and receive the real `407` response, allowing legitimate clients to discover that authentication is required.
@@ -466,13 +466,13 @@ The SOCKS5 handler implements RFC 1928 (SOCKS Protocol Version 5) and RFC 1929 (
 Server:
 
 ```bash
-rustun -L socks5://:1080
+rt -L socks5://:1080
 ```
 
-Client (using rustun as a chain node):
+Client (using rt as a chain node):
 
 ```bash
-rustun -L :8080 -F socks5://server_ip:1080
+rt -L :8080 -F socks5://server_ip:1080
 ```
 
 Supported SOCKS5 features:
@@ -497,7 +497,7 @@ The SOCKS4 handler implements the original SOCKS4 protocol (IPv4 addresses only)
 Server:
 
 ```bash
-rustun -L socks4://:1080
+rt -L socks4://:1080
 ```
 
 SOCKS4a is automatically supported: when the client sets the IP address to `0.0.0.x` (where `x` is non-zero) and appends a null-terminated domain name after the user ID, the handler resolves the domain name to connect to the target.
@@ -520,11 +520,11 @@ This allows a single port to serve all three proxy protocols simultaneously.
 
 ## 7. Transport Types
 
-The transport layer determines how data is carried on the wire between rustun and the next proxy node. The transport is specified after the `+` in the scheme:
+The transport layer determines how data is carried on the wire between rt and the next proxy node. The transport is specified after the `+` in the scheme:
 
 ```bash
-rustun -L http+tls://:443       # HTTP proxy over TLS
-rustun -L :8080 -F socks5+ws://proxy:8080  # SOCKS5 over WebSocket
+rt -L http+tls://:443       # HTTP proxy over TLS
+rt -L :8080 -F socks5+ws://proxy:8080  # SOCKS5 over WebSocket
 ```
 
 ### TCP (default)
@@ -533,27 +533,27 @@ Raw TCP connection. Used when no transport is specified.
 
 ### TLS
 
-TLS encrypts the TCP connection. rustun supports custom certificates, client certificate authentication (mTLS), and certificate pinning.
+TLS encrypts the TCP connection. rt supports custom certificates, client certificate authentication (mTLS), and certificate pinning.
 
 Server (with custom certificate):
 
 ```bash
-rustun -L "http+tls://:443?cert=cert.pem&key=key.pem"
+rt -L "http+tls://:443?cert=cert.pem&key=key.pem"
 ```
 
 Client (with server verification):
 
 ```bash
-rustun -L :8080 -F "http+tls://server:443?secure=true"
+rt -L :8080 -F "http+tls://server:443?secure=true"
 ```
 
 Client (with CA certificate pinning):
 
 ```bash
-rustun -L :8080 -F "http+tls://server:443?ca=ca.pem"
+rt -L :8080 -F "http+tls://server:443?ca=ca.pem"
 ```
 
-If no certificate files are provided, rustun looks for `cert.pem` and `key.pem` in the current working directory. If those are not found, a random self-signed certificate is generated.
+If no certificate files are provided, rt looks for `cert.pem` and `key.pem` in the current working directory. If those are not found, a random self-signed certificate is generated.
 
 ### WebSocket
 
@@ -562,13 +562,13 @@ WebSocket transport frames proxy data as binary WebSocket messages. This is usef
 Server:
 
 ```bash
-rustun -L "socks5+ws://:8080?path=/ws"
+rt -L "socks5+ws://:8080?path=/ws"
 ```
 
 Client:
 
 ```bash
-rustun -L :8080 -F "socks5+ws://server:8080?path=/ws"
+rt -L :8080 -F "socks5+ws://server:8080?path=/ws"
 ```
 
 The `path` parameter sets the WebSocket endpoint URL path. Both `ws` (plain) and `wss` (TLS-encrypted) variants are supported. Multiplexed variants `mws` and `mwss` use stream multiplexing over a single WebSocket connection.
@@ -582,13 +582,13 @@ SSH transport uses the SSH protocol (RFC 4253/4254) for encrypted tunneling with
 Server:
 
 ```bash
-rustun -L forward+ssh://:2222
+rt -L forward+ssh://:2222
 ```
 
 Client (remote port forwarding):
 
 ```bash
-rustun -L rtcp://:1222/:22 -F forward+ssh://server:2222
+rt -L rtcp://:1222/:22 -F forward+ssh://server:2222
 ```
 
 **Transport Tunnel**: Used as a general-purpose encrypted transport for proxy protocols.
@@ -596,13 +596,13 @@ rustun -L rtcp://:1222/:22 -F forward+ssh://server:2222
 Server:
 
 ```bash
-rustun -L ssh://:2222
+rt -L ssh://:2222
 ```
 
 Client:
 
 ```bash
-rustun -L :8080 -F "ssh://server:2222?ping=60"
+rt -L :8080 -F "ssh://server:2222?ping=60"
 ```
 
 The `ping` parameter enables heartbeat detection with the specified interval in seconds.
@@ -614,19 +614,19 @@ KCP is a UDP-based reliable transport protocol that provides faster delivery tha
 Server:
 
 ```bash
-rustun -L kcp://:8388
+rt -L kcp://:8388
 ```
 
 Client:
 
 ```bash
-rustun -L :8080 -F kcp://server:8388
+rt -L :8080 -F kcp://server:8388
 ```
 
-KCP configuration is loaded from a JSON file. rustun automatically loads `kcp.json` from the working directory if it exists, or you can specify a path:
+KCP configuration is loaded from a JSON file. rt automatically loads `kcp.json` from the working directory if it exists, or you can specify a path:
 
 ```bash
-rustun -L "kcp://:8388?c=/path/to/kcp.json"
+rt -L "kcp://:8388?c=/path/to/kcp.json"
 ```
 
 KCP JSON configuration fields:
@@ -664,13 +664,13 @@ QUIC is a UDP-based multiplexed transport protocol. It provides built-in encrypt
 Server:
 
 ```bash
-rustun -L quic://:6121
+rt -L quic://:6121
 ```
 
 Client:
 
 ```bash
-rustun -L :8080 -F "quic://server:6121?keepalive=true"
+rt -L :8080 -F "quic://server:6121?keepalive=true"
 ```
 
 QUIC nodes can only be used as the first node of a proxy chain.
@@ -683,23 +683,23 @@ HTTP/2 transport supports two modes:
 
 ```bash
 # Server
-rustun -L http2://:443
+rt -L http2://:443
 
 # Client
-rustun -L :8080 -F "http2://server:443?ping=30"
+rt -L :8080 -F "http2://server:443?ping=30"
 ```
 
 **Tunnel** (`h2` / `h2c`): Uses HTTP/2 as a pure transport tunnel. `h2` uses TLS encryption; `h2c` uses cleartext HTTP/2.
 
 ```bash
 # Server (TLS)
-rustun -L h2://:443
+rt -L h2://:443
 
 # Server (cleartext)
-rustun -L h2c://:8080
+rt -L h2c://:8080
 
 # Client
-rustun -L :8080 -F h2://server:443
+rt -L :8080 -F h2://server:443
 ```
 
 ### FakeTCP
@@ -714,10 +714,10 @@ VSOCK (Virtual Socket) provides communication between a virtual machine and its 
 
 ## 8. Proxy Chaining
 
-Proxy chains route traffic through a sequence of proxy servers. Each `-F` flag appends a node to the chain. When a client connects, rustun dials through the chain sequentially:
+Proxy chains route traffic through a sequence of proxy servers. Each `-F` flag appends a node to the chain. When a client connects, rt dials through the chain sequentially:
 
 ```bash
-rustun -L :8080 -F http://proxy1:3128 -F socks5://proxy2:1080
+rt -L :8080 -F http://proxy1:3128 -F socks5://proxy2:1080
 ```
 
 The connection process:
@@ -739,7 +739,7 @@ Each node in the chain can use any supported protocol+transport combination. The
 ### Chain with Different Transports
 
 ```bash
-rustun -L :8080 \
+rt -L :8080 \
     -F "http+tls://proxy1:443?secure=true" \
     -F "socks5+ws://proxy2:8080?path=/tunnel" \
     -F "relay+tls://proxy3:8443"
@@ -754,25 +754,25 @@ rustun -L :8080 \
 Forward all TCP connections arriving on a local port to a remote target address. The remote address is specified as the path component of the URL:
 
 ```bash
-rustun -L tcp://:2222/192.168.1.1:22
+rt -L tcp://:2222/192.168.1.1:22
 ```
 
 This binds to local port 2222 and forwards every incoming connection to `192.168.1.1:22`. If a proxy chain is specified via `-F`, the forwarding goes through the chain:
 
 ```bash
-rustun -L tcp://:2222/192.168.1.1:22 -F http://proxy:8080
+rt -L tcp://:2222/192.168.1.1:22 -F http://proxy:8080
 ```
 
-When the last node of the chain uses SSH forward transport, rustun uses SSH direct port forwarding (RFC 4254 Section 7.2):
+When the last node of the chain uses SSH forward transport, rt uses SSH direct port forwarding (RFC 4254 Section 7.2):
 
 ```bash
-rustun -L tcp://:2222/192.168.1.1:22 -F forward+ssh://server:2222
+rt -L tcp://:2222/192.168.1.1:22 -F forward+ssh://server:2222
 ```
 
 Multiple remote addresses may be specified (comma-separated) for load balancing:
 
 ```bash
-rustun -L tcp://:8080/10.0.0.1:80,10.0.0.2:80,10.0.0.3:80
+rt -L tcp://:8080/10.0.0.1:80,10.0.0.2:80,10.0.0.3:80
 ```
 
 ### Local UDP Port Forwarding
@@ -780,7 +780,7 @@ rustun -L tcp://:8080/10.0.0.1:80,10.0.0.2:80,10.0.0.3:80
 Forward all UDP datagrams arriving on a local port to a remote target address:
 
 ```bash
-rustun -L "udp://:5353/192.168.1.1:53?ttl=60"
+rt -L "udp://:5353/192.168.1.1:53?ttl=60"
 ```
 
 Each UDP forwarding channel has an idle timeout. When no data is exchanged within this period, the channel is closed. The timeout is set via the `ttl` parameter (default: 60 seconds).
@@ -789,22 +789,22 @@ When forwarding UDP data through a proxy chain, the last node in the chain must 
 
 ### Remote TCP Port Forwarding
 
-In remote forwarding, rustun listens on a port at the remote end (the last proxy in the chain) and forwards connections back to a local target:
+In remote forwarding, rt listens on a port at the remote end (the last proxy in the chain) and forwards connections back to a local target:
 
 ```bash
-rustun -L rtcp://:2222/192.168.1.1:22 -F socks5://172.24.10.1:1080
+rt -L rtcp://:2222/192.168.1.1:22 -F socks5://172.24.10.1:1080
 ```
 
-This causes port 2222 on `172.24.10.1` to forward connections to `192.168.1.1:22`. When the last node uses SSH forward transport, rustun uses SSH remote port forwarding (RFC 4254 Section 7.1):
+This causes port 2222 on `172.24.10.1` to forward connections to `192.168.1.1:22`. When the last node uses SSH forward transport, rt uses SSH remote port forwarding (RFC 4254 Section 7.1):
 
 ```bash
-rustun -L rtcp://:2222/192.168.1.1:22 -F forward+ssh://server:2222
+rt -L rtcp://:2222/192.168.1.1:22 -F forward+ssh://server:2222
 ```
 
 ### Remote UDP Port Forwarding
 
 ```bash
-rustun -L "rudp://:5353/192.168.1.1:53?ttl=60" -F socks5://172.24.10.1:1080
+rt -L "rudp://:5353/192.168.1.1:53?ttl=60" -F socks5://172.24.10.1:1080
 ```
 
 ---
@@ -814,7 +814,7 @@ rustun -L "rudp://:5353/192.168.1.1:53?ttl=60" -F socks5://172.24.10.1:1080
 The DNS proxy handler forwards DNS queries to an upstream DNS resolver. The upstream address is specified as the path component:
 
 ```bash
-rustun -L dns://:5353/8.8.8.8:53
+rt -L dns://:5353/8.8.8.8:53
 ```
 
 This listens for DNS queries on local port 5353 (TCP) and forwards them to Google Public DNS at `8.8.8.8:53` via UDP.
@@ -828,7 +828,7 @@ The DNS resolver module also supports DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH
 The SNI (Server Name Indication) proxy inspects the TLS ClientHello message to extract the server name, then routes the connection to the appropriate backend server.
 
 ```bash
-rustun -L sni://:443
+rt -L sni://:443
 ```
 
 The handler performs the following steps:
@@ -847,7 +847,7 @@ If the connection does not begin with a TLS handshake, it is treated as a plain 
 Transparent proxying intercepts connections without requiring client-side proxy configuration. This uses iptables REDIRECT or TPROXY rules on Linux.
 
 ```bash
-rustun -L redirect://:12345 -F http2://server:443
+rt -L redirect://:12345 -F http2://server:443
 ```
 
 The transparent proxy handler uses the `SO_ORIGINAL_DST` socket option to recover the original destination address (set by iptables REDIRECT). It then connects to that address through the proxy chain.
@@ -861,7 +861,7 @@ iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 12345
 UDP transparent proxying is also supported via TPROXY:
 
 ```bash
-rustun -L "redu://:12345?ttl=60"
+rt -L "redu://:12345?ttl=60"
 ```
 
 ---
@@ -873,19 +873,19 @@ The relay protocol is a lightweight custom protocol designed for efficient tunne
 Server (with fixed target):
 
 ```bash
-rustun -L relay://:8443/192.168.1.1:80
+rt -L relay://:8443/192.168.1.1:80
 ```
 
 Server (dynamic target from client):
 
 ```bash
-rustun -L relay://user:pass@:8443
+rt -L relay://user:pass@:8443
 ```
 
 Client:
 
 ```bash
-rustun -L :8080 -F relay://user:pass@server:8443
+rt -L :8080 -F relay://user:pass@server:8443
 ```
 
 The relay protocol frame format includes a version byte, flags (including a UDP flag for UDP relay), and feature fields for user authentication and address specification.
@@ -899,13 +899,13 @@ Shadowsocks is an encrypted proxy protocol. The cipher method and password are s
 Server:
 
 ```bash
-rustun -L ss://aes-128-gcm:123456@:8338
+rt -L ss://aes-128-gcm:123456@:8338
 ```
 
 Client:
 
 ```bash
-rustun -L :8080 -F ss://aes-128-gcm:123456@server:8338
+rt -L :8080 -F ss://aes-128-gcm:123456@server:8338
 ```
 
 Supported cipher methods:
@@ -924,7 +924,7 @@ Key derivation uses the EVP_BytesToKey algorithm (OpenSSL-compatible) to convert
 UDP relay is supported via the `ssu` scheme:
 
 ```bash
-rustun -L ssu://aes-128-gcm:123456@:8338
+rt -L ssu://aes-128-gcm:123456@:8338
 ```
 
 ---
@@ -936,8 +936,8 @@ rustun -L ssu://aes-128-gcm:123456@:8338
 The simplest authentication method embeds credentials directly in the URL:
 
 ```bash
-rustun -L http://admin:secret@:8080
-rustun -L socks5://user:password@:1080
+rt -L http://admin:secret@:8080
+rt -L socks5://user:password@:1080
 ```
 
 When inline credentials are provided on a `-L` address, the handler requires all incoming clients to authenticate with those exact credentials.
@@ -947,7 +947,7 @@ When inline credentials are provided on a `-L` address, the handler requires all
 For multiple user accounts, use a secrets file:
 
 ```bash
-rustun -L "http://:8080?secrets=users.txt"
+rt -L "http://:8080?secrets=users.txt"
 ```
 
 The file contains one `username password` pair per line. Lines starting with `#` are comments. Blank lines are ignored. A special `reload` directive sets the live-reload interval:
@@ -980,7 +980,7 @@ The authenticator periodically checks the file modification time and reloads aut
 The bypass system determines which addresses are allowed or denied. A bypass list contains matcher patterns applied to the target address of each connection.
 
 ```bash
-rustun -L "http://:8080?bypass=192.168.0.0/16,*.internal.com,10.0.0.1"
+rt -L "http://:8080?bypass=192.168.0.0/16,*.internal.com,10.0.0.1"
 ```
 
 Matcher types:
@@ -994,7 +994,7 @@ By default (non-reversed mode), when a target address matches any bypass pattern
 **Reversed mode**: Prefix the bypass value with `~` to invert the logic. In reversed mode, only addresses matching the patterns are allowed; all others are rejected.
 
 ```bash
-rustun -L "http://:8080?bypass=~*.allowed.com,10.0.0.0/8"
+rt -L "http://:8080?bypass=~*.allowed.com,10.0.0.0/8"
 ```
 
 Bypass patterns can also be loaded from a file (one pattern per line) with live-reload support:
@@ -1014,7 +1014,7 @@ reverse true
 Permissions provide fine-grained access control using the format `action:host_pattern:port_range`. Multiple permission rules are separated by spaces.
 
 ```bash
-rustun -L "http://:8080?whitelist=tcp:*:80,443&blacklist=tcp:evil.com:*"
+rt -L "http://:8080?whitelist=tcp:*:80,443&blacklist=tcp:evil.com:*"
 ```
 
 The access check logic is:
@@ -1049,12 +1049,12 @@ whitelist=tcp:*:80,443&blacklist=tcp:malware.com,ads.tracker.com:*
 
 ## 17. Load Balancing
 
-When a proxy chain node group contains multiple nodes, rustun selects among them using a configurable strategy.
+When a proxy chain node group contains multiple nodes, rt selects among them using a configurable strategy.
 
 Multiple nodes are configured either through the `ip` query parameter or through a peer configuration file:
 
 ```bash
-rustun -L :8080 -F "http://proxy1:8080?ip=proxy2:8080,proxy3:8080&strategy=round&max_fails=3&fail_timeout=30s"
+rt -L :8080 -F "http://proxy1:8080?ip=proxy2:8080,proxy3:8080&strategy=round&max_fails=3&fail_timeout=30s"
 ```
 
 ### Selection Strategies
@@ -1088,14 +1088,14 @@ The `fastest_count` parameter enables latency-based filtering. Nodes are periodi
 
 ### Built-in Certificate
 
-rustun includes the ability to generate a random self-signed TLS certificate at startup. This is used when no certificate files are provided.
+rt includes the ability to generate a random self-signed TLS certificate at startup. This is used when no certificate files are provided.
 
 ### Custom Certificate
 
-Place `cert.pem` (public key) and `key.pem` (private key) in the current working directory, and rustun loads them automatically. Alternatively, specify paths explicitly:
+Place `cert.pem` (public key) and `key.pem` (private key) in the current working directory, and rt loads them automatically. Alternatively, specify paths explicitly:
 
 ```bash
-rustun -L "http+tls://:443?cert=/path/to/cert.pem&key=/path/to/key.pem"
+rt -L "http+tls://:443?cert=/path/to/cert.pem&key=/path/to/key.pem"
 ```
 
 ### Server Certificate Verification
@@ -1103,7 +1103,7 @@ rustun -L "http+tls://:443?cert=/path/to/cert.pem&key=/path/to/key.pem"
 By default, clients do not verify the server certificate (matching gost behavior for self-signed certificates). Enable verification with:
 
 ```bash
-rustun -L :8080 -F "http+tls://server:443?secure=true"
+rt -L :8080 -F "http+tls://server:443?secure=true"
 ```
 
 ### Certificate Pinning
@@ -1111,12 +1111,12 @@ rustun -L :8080 -F "http+tls://server:443?secure=true"
 Specify a CA certificate to restrict which certificates are trusted:
 
 ```bash
-rustun -L :8080 -F "http+tls://server:443?ca=ca.pem"
+rt -L :8080 -F "http+tls://server:443?ca=ca.pem"
 ```
 
 ### SOCKS5 TLS Extension
 
-When both client and server are rustun (or gost) instances, SOCKS5 connections negotiate TLS encryption using extended methods `0x80` (TLS) and `0x82` (TLS with authentication). This provides end-to-end encryption without requiring a separate TLS transport layer.
+When both client and server are rt (or gost) instances, SOCKS5 connections negotiate TLS encryption using extended methods `0x80` (TLS) and `0x82` (TLS with authentication). This provides end-to-end encryption without requiring a separate TLS transport layer.
 
 ---
 
@@ -1131,13 +1131,13 @@ Disguises the connection as an HTTP WebSocket upgrade. The handshake sends a leg
 Server:
 
 ```bash
-rustun -L http+ohttp://:8080
+rt -L http+ohttp://:8080
 ```
 
 Client:
 
 ```bash
-rustun -L :8080 -F http+ohttp://server:8080
+rt -L :8080 -F http+ohttp://server:8080
 ```
 
 ### TLS Obfuscation
@@ -1147,13 +1147,13 @@ Disguises the connection as a TLS handshake. The client sends a synthetic TLS Cl
 Server:
 
 ```bash
-rustun -L http+otls://:8443
+rt -L http+otls://:8443
 ```
 
 Client:
 
 ```bash
-rustun -L :8080 -F http+otls://server:8443
+rt -L :8080 -F http+otls://server:8443
 ```
 
 ### Obfs4
@@ -1163,25 +1163,25 @@ Obfs4 is a pluggable transport from the Tor Project that provides strong obfusca
 Server:
 
 ```bash
-rustun -L obfs4://:443
+rt -L obfs4://:443
 ```
 
 The server prints the client connection string (including the `cert` parameter). Client:
 
 ```bash
-rustun -L :8080 -F "obfs4://server:443?cert=<base64-cert>&iat-mode=0"
+rt -L :8080 -F "obfs4://server:443?cert=<base64-cert>&iat-mode=0"
 ```
 
 ---
 
 ## 20. TUN/TAP Device
 
-TUN (Layer 3) and TAP (Layer 2) virtual network devices allow rustun to operate as a VPN tunnel.
+TUN (Layer 3) and TAP (Layer 2) virtual network devices allow rt to operate as a VPN tunnel.
 
 ### TUN
 
 ```bash
-rustun -L "tun://:0?name=tun0&net=10.0.0.1/24&mtu=1350&route=192.168.0.0/16&gw=10.0.0.1"
+rt -L "tun://:0?name=tun0&net=10.0.0.1/24&mtu=1350&route=192.168.0.0/16&gw=10.0.0.1"
 ```
 
 Parameters:
@@ -1196,7 +1196,7 @@ Parameters:
 ### TAP
 
 ```bash
-rustun -L "tap://:0?name=tap0&net=10.0.0.1/24&mtu=1500&route=192.168.0.0/16&gw=10.0.0.1"
+rt -L "tap://:0?name=tap0&net=10.0.0.1/24&mtu=1500&route=192.168.0.0/16&gw=10.0.0.1"
 ```
 
 TAP devices operate at the Ethernet frame level (Layer 2), supporting broadcast, ARP, and other Layer 2 protocols.
@@ -1205,7 +1205,7 @@ TAP devices operate at the Ethernet frame level (Layer 2), supporting broadcast,
 
 ## 21. Live Reload
 
-Configuration files, authenticator secrets files, bypass lists, hosts files, and DNS resolver configurations support automatic live reloading. When the file modification time changes, rustun re-reads and applies the new content without restarting.
+Configuration files, authenticator secrets files, bypass lists, hosts files, and DNS resolver configurations support automatic live reloading. When the file modification time changes, rt re-reads and applies the new content without restarting.
 
 The reload period is specified within the file using a `reload` directive:
 
@@ -1240,7 +1240,7 @@ A reload period of `0` disables reloading. A negative period (set internally by 
 
 ## 22. Architecture
 
-rustun follows a layered architecture that mirrors the design of gost:
+rt follows a layered architecture that mirrors the design of gost:
 
 ```
     +--------------------------------------------+
@@ -1338,20 +1338,20 @@ A multi-stage `Dockerfile` and a `docker-compose.yml` are provided for container
 ### Building the Docker Image
 
 ```bash
-docker build -t rustun .
+docker build -t rt .
 ```
 
 ### Running with Docker
 
 ```bash
 # HTTP proxy
-docker run -p 8080:8080 rustun -L http://:8080
+docker run -p 8080:8080 rt -L http://:8080
 
 # SOCKS5 proxy with authentication
-docker run -p 1080:1080 rustun -L socks5://admin:pass@:1080
+docker run -p 1080:1080 rt -L socks5://admin:pass@:1080
 
 # From a config file
-docker run -v ./config.json:/etc/rustun/config.json rustun -C /etc/rustun/config.json
+docker run -v ./config.json:/etc/rt/config.json rt -C /etc/rt/config.json
 ```
 
 ### Docker Compose
@@ -1371,7 +1371,7 @@ Services defined: `http-proxy` (8080), `socks5-proxy` (1080), `auto-proxy` (8888
 
 ## 25. Examples
 
-Shell scripts in the `examples/` directory demonstrate each major feature with real network commands. Each script starts a rustun instance, sends test traffic, and verifies the result.
+Shell scripts in the `examples/` directory demonstrate each major feature with real network commands. Each script starts an rt instance, sends test traffic, and verifies the result.
 
 | Script | Feature Tested |
 |--------|----------------|
@@ -1402,9 +1402,9 @@ and the release workflow, so that is where the cost belongs.
 
 ## 27. Interoperability
 
-Compatibility with gost is verified by running rustun against the real gost
-2.12.0 binary, in both directions for each scheme: rustun as the client dialing
-a gost listener, and gost as the client dialing a rustun listener. `interop.sh`
+Compatibility with gost is verified by running rt against the real gost
+2.12.0 binary, in both directions for each scheme: rt as the client dialing
+a gost listener, and gost as the client dialing an rt listener. `interop.sh`
 drives the transport and protocol matrix; `interop-adv.sh` covers chain
 authentication, a rejected password, and multi-hop chains including a
 transport on a middle hop. Both need a `gost` binary and `curl`.
@@ -1425,7 +1425,7 @@ and `-F relay://` were absent from the chain's connector dispatch entirely.
 
 ## 28. Implementation Status
 
-This table records the honest state of each gost feature in rustun, audited
+This table records the honest state of each gost feature in rt, audited
 module by module against ginuerzh/gost. It is deliberately conservative: a row
 says **Working** only when the feature is reachable from the command line and
 covered by tests, not merely when the types exist.
@@ -1443,7 +1443,7 @@ The TLS listener is backed by rustls, so the server identity is built the same
 way on every platform. The end-to-end tests drive a native-tls client against it,
 making them cross-implementation rather than self-consistent.
 
-| gost Feature | rustun Status | Notes |
+| gost Feature | rt Status | Notes |
 |--------------|---------------|-------|
 | HTTP proxy (CONNECT + forward) | Working | Auth, bypass, whitelist/blacklist; request bodies preserved; origin-form forwarding |
 | HTTP probe_resist / knock | Working | All four modes (`code:`/`web:`/`host:`/`file:`) with nginx camouflage headers; `?knock=` bypass. `web:` supports http:// decoys only |

@@ -5,11 +5,11 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
-use rustun::*;
+use rt::*;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rustun",
+    name = "rt",
     version = VERSION,
     about = "A tunnel and proxy tool written in Rust",
     disable_version_flag = true
@@ -54,7 +54,7 @@ async fn main() {
 
     if cli.print_version {
         println!(
-            "rustun {} (rustc {}/{})",
+            "rt {} (rustc {}/{})",
             VERSION,
             std::env::consts::OS,
             std::env::consts::ARCH
