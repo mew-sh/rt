@@ -596,6 +596,37 @@ async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, Ch
                 })?;
             Ok(ProxyConn::layered(Box::new(ws), peer, local))
         }
+        // Obfuscation only reframes the socket; the hop's protocol connector
+        // then runs inside it exactly as it would over plain TCP.
+        "ohttp" | "otls" => {
+            let host = hop_hostname(node);
+            let peer = stream.peer_addr();
+            let local = stream.local_addr();
+            let framed: Box<dyn crate::conn::AsyncStream> = if node.transport == "otls" {
+                Box::new(
+                    crate::obfs_transport::otls_connect(stream, &host)
+                        .await
+                        .map_err(|e| {
+                            ChainError::ProxyError(format!(
+                                "obfs-tls handshake with {} failed: {}",
+                                host, e
+                            ))
+                        })?,
+                )
+            } else {
+                Box::new(
+                    crate::obfs_transport::ohttp_connect(stream, &host)
+                        .await
+                        .map_err(|e| {
+                            ChainError::ProxyError(format!(
+                                "obfs-http handshake with {} failed: {}",
+                                host, e
+                            ))
+                        })?,
+                )
+            };
+            Ok(ProxyConn::layered(framed, peer, local))
+        }
         // `http2` layers only TLS here; its CONNECT is the protocol connector
         // below, which is how gost splits transporter from connector
         // (http2.go:122-199).

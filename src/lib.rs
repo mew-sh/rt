@@ -27,6 +27,7 @@ pub mod mux;
 pub mod mux_transport;
 pub mod node;
 pub mod obfs;
+pub mod obfs_transport;
 pub mod permissions;
 pub mod quic_transport;
 pub mod redirect;

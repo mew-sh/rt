@@ -347,7 +347,7 @@ fn load_secrets_file(path: &str) -> Result<LocalAuthenticator, std::io::Error> {
 /// plaintext TCP under an encrypted-looking scheme.
 const SUPPORTED_LISTENER_TRANSPORTS: &[&str] = &[
     "tcp", "tls", "ws", "wss", "mtls", "mws", "mwss", "quic", "kcp", "udp", "rtcp", "rudp", "dns",
-    "redu", "h2", "h2c", "http2",
+    "redu", "h2", "h2c", "http2", "ohttp", "otls",
 ];
 
 fn ensure_listener_transport_supported(
@@ -394,6 +394,8 @@ fn ensure_chain_transport_supported(node: &Node) -> Result<(), Box<dyn std::erro
             | "h2"
             | "h2c"
             | "http2"
+            | "ohttp"
+            | "otls"
     ) {
         return Ok(());
     }
@@ -583,6 +585,25 @@ async fn run_server(
                 }
                 _ => MuxServer::new_mws(&addr, ws_options(&node), mux, handler).await?,
             };
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
+        // Obfuscation is a framing layer over a plain socket: the handshake
+        // runs per connection inside the handler, which then passes the framed
+        // stream to the protocol handler.
+        "ohttp" | "otls" => {
+            let kind = if node.transport == "otls" {
+                obfs_transport::ObfsKind::Tls
+            } else {
+                obfs_transport::ObfsKind::Http
+            };
+            let handler = obfs_transport::ObfsHandler::new(handler, kind);
+            let server = Server::new(&addr, handler).await?;
             let server_cancel = server.cancel_token();
             let cancel_clone = cancel.clone();
             tokio::spawn(async move {
