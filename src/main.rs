@@ -367,7 +367,7 @@ fn ensure_chain_transport_supported(node: &Node) -> Result<(), Box<dyn std::erro
     let transport = node.transport.as_str();
     if matches!(
         transport,
-        "" | "tcp" | "tls" | "ws" | "wss" | "mtls" | "mws" | "mwss"
+        "" | "tcp" | "tls" | "ws" | "wss" | "mtls" | "mws" | "mwss" | "quic"
     ) {
         return Ok(());
     }

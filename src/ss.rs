@@ -433,11 +433,10 @@ impl ShadowConnector {
     }
 
     /// Connect via Shadowsocks protocol.
-    pub async fn connect(
-        &self,
-        conn: TcpStream,
-        address: &str,
-    ) -> Result<SsStream<TcpStream>, HandlerError> {
+    pub async fn connect<S>(&self, conn: S, address: &str) -> Result<SsStream<S>, HandlerError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         let mut stream = SsStream::new(conn, self.cipher.clone(), self.key.clone());
 
         // The address header is the first payload inside the encrypted stream,

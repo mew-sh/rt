@@ -22,6 +22,9 @@ pub struct Chain {
     /// through this chain reuses the same session per node — which is the
     /// entire reason the multiplexed transports exist.
     mux_dialers: std::sync::Arc<crate::mux_transport::MuxDialerPool>,
+    /// Live QUIC connections, keyed by hop, for the same reason as the smux
+    /// pool: one connection per node, a stream per dial.
+    quic_transporters: std::sync::Arc<QuicTransporterPool>,
     node_groups: Vec<NodeGroup>,
     is_route: bool,
 }
@@ -37,6 +40,7 @@ impl Chain {
             hosts: None,
             resolver: None,
             mux_dialers: std::sync::Arc::new(crate::mux_transport::MuxDialerPool::new()),
+            quic_transporters: std::sync::Arc::new(QuicTransporterPool::default()),
             node_groups,
             is_route: false,
         }
@@ -51,6 +55,7 @@ impl Chain {
             hosts: None,
             resolver: None,
             mux_dialers: std::sync::Arc::new(crate::mux_transport::MuxDialerPool::new()),
+            quic_transporters: std::sync::Arc::new(QuicTransporterPool::default()),
             node_groups: Vec::new(),
             is_route: false,
         }
@@ -180,6 +185,8 @@ impl Chain {
         debug!("[chain] connecting to first node: {}", first.addr);
         let mut current = if is_mux_transport(&first.transport) {
             self.dial_mux_hop(first, timeout).await?
+        } else if first.transport == "quic" {
+            self.dial_quic_hop(first).await?
         } else {
             let conn = self.connect_tcp(&first.addr, timeout).await?;
             layer_transport(ProxyConn::from_tcp(conn), first).await?
@@ -191,7 +198,7 @@ impl Chain {
         // connector — gost's Dial -> Handshake -> Connect order
         // (chain.go:286-319).
         for (i, node) in nodes.iter().enumerate().skip(1) {
-            if is_mux_transport(&node.transport) {
+            if is_mux_transport(&node.transport) || node.transport == "quic" {
                 // Reaching it would mean building a session over the previous
                 // hop's connection, and a session per dial defeats the point.
                 // gost dials such a hop through a sub-chain; not implemented.
@@ -281,6 +288,33 @@ impl Chain {
             rx: tokio::sync::Mutex::new(in_rx),
             _pump: DropGuard(vec![writer, reader]),
         })
+    }
+
+    /// Opens a stream on this hop's QUIC connection, establishing the
+    /// connection the first time.
+    ///
+    /// Like a mux hop, this owns its dial: QUIC carries many streams on one
+    /// connection, so handing it a socket per dial would defeat the point.
+    async fn dial_quic_hop(&self, node: &Node) -> Result<ProxyConn, ChainError> {
+        let config = crate::quic_transport::quic_config_from_node(node)
+            .map_err(|e| ChainError::ProxyError(e.to_string()))?;
+
+        // Keyed by the hop's own parameters, since two nodes on the same host
+        // may differ in `?cipher=` or keep-alive.
+        let key = format!(
+            "quic|{}|{}|{}",
+            node.addr,
+            node.get("cipher").unwrap_or(""),
+            node.get("keepalive").unwrap_or("")
+        );
+        let transporter = self.quic_transporters.get_or_create(&key, config)?;
+
+        let stream = transporter
+            .dial(&node.addr)
+            .await
+            .map_err(|e| ChainError::ProxyError(format!("quic hop failed: {}", e)))?;
+
+        Ok(ProxyConn::layered(Box::new(stream), None, None))
     }
 
     /// Opens a stream on this hop's smux session, building the session (and the
@@ -566,6 +600,54 @@ impl UdpChannel {
     }
 }
 
+/// One `QuicTransporter` per hop configuration.
+///
+/// `QuicTransporter` already pools connections by address, but its config comes
+/// from the node, so hops with different `?cipher=` or keep-alive settings need
+/// their own.
+#[derive(Default)]
+pub struct QuicTransporterPool {
+    inner: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<crate::quic_transport::QuicTransporter>>,
+    >,
+}
+
+impl std::fmt::Debug for QuicTransporterPool {
+    // Hand-written because a transporter holds live endpoints, which are not
+    // Debug, and `Chain` derives Debug.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<String> = match self.inner.lock() {
+            Ok(m) => m.keys().cloned().collect(),
+            Err(p) => p.into_inner().keys().cloned().collect(),
+        };
+        f.debug_struct("QuicTransporterPool")
+            .field("nodes", &keys)
+            .finish()
+    }
+}
+
+impl QuicTransporterPool {
+    fn get_or_create(
+        &self,
+        key: &str,
+        config: crate::quic_transport::QuicConfig,
+    ) -> Result<std::sync::Arc<crate::quic_transport::QuicTransporter>, ChainError> {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = map.get(key) {
+            return Ok(existing.clone());
+        }
+        let created = std::sync::Arc::new(
+            crate::quic_transport::QuicTransporter::new(config)
+                .map_err(|e| ChainError::ProxyError(e.to_string()))?,
+        );
+        map.insert(key.to_string(), created.clone());
+        Ok(created)
+    }
+}
+
 /// Whether a hop's transport carries many streams over one session, and so
 /// must own its dial rather than be layered over a socket it is handed.
 fn is_mux_transport(transport: &str) -> bool {
@@ -610,13 +692,40 @@ async fn connect_via(
     target: &str,
 ) -> Result<ProxyConn, ChainError> {
     match node.protocol.as_str() {
-        "http" => http_connect(stream, target, node.user.as_ref()).await,
+        // An empty protocol is gost's `auto`, whose connector is the HTTP one
+        // for TCP (client.go:62-72). Treating it as a pass-through means no
+        // CONNECT is ever sent, so a node like `-F tls://host:443` reaches the
+        // proxy and then asks it for nothing.
+        "http" | "" => http_connect(stream, target, node.user.as_ref()).await,
         "socks5" => socks5_connect(stream, target, node.user.as_ref()).await,
         "socks4" => socks4_connect(stream, target, node.user.as_ref(), false).await,
         "socks4a" => socks4_connect(stream, target, node.user.as_ref(), true).await,
+        "ss" => {
+            // gost takes the cipher from the userinfo username, as on the
+            // listener side (route.go:263, ss.go:589-590).
+            let (method, password) = match node.user.as_ref() {
+                Some((m, p)) => (m.as_str(), p.clone().unwrap_or_default()),
+                None => ("plain", String::new()),
+            };
+            let connector = crate::ss::ShadowConnector::new(method, &password)
+                .map_err(|e| ChainError::ProxyError(e.to_string()))?;
+            let stream = connector
+                .connect(stream, target)
+                .await
+                .map_err(|e| ChainError::ProxyError(e.to_string()))?;
+            Ok(ProxyConn::layered(Box::new(stream), None, None))
+        }
+        "relay" => {
+            let connector = crate::relay::RelayConnector::new(node.user.clone());
+            let stream = connector
+                .connect(stream, "tcp", target)
+                .await
+                .map_err(|e| ChainError::ProxyError(e.to_string()))?;
+            Ok(ProxyConn::layered(Box::new(stream), None, None))
+        }
         // "forward"/"direct"/"remote" hand the connection straight through;
         // the node itself is the endpoint rather than a proxy to traverse.
-        "forward" | "direct" | "remote" | "" => Ok(stream),
+        "forward" | "direct" | "remote" => Ok(stream),
         other => Err(ChainError::ProxyError(format!(
             "chain node protocol {:?} is not supported as a chain connector",
             other

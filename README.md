@@ -32,10 +32,11 @@ rustun provides a unified command-line interface for proxying, tunneling, and fo
 24. [Docker](#24-docker)
 25. [Examples](#25-examples)
 26. [Build Profile](#26-build-profile)
-27. [Implementation Status](#27-implementation-status)
-28. [Module Reference](#28-module-reference)
-29. [Testing](#29-testing)
-30. [License](#30-license)
+27. [Interoperability](#27-interoperability)
+28. [Implementation Status](#28-implementation-status)
+29. [Module Reference](#29-module-reference)
+30. [Testing](#30-testing)
+31. [License](#31-license)
 
 ---
 
@@ -1399,7 +1400,27 @@ and the release workflow, so that is where the cost belongs.
 
 ---
 
-## 27. Implementation Status
+## 27. Interoperability
+
+Compatibility with gost is verified by running rustun against the real gost
+2.12.0 binary, in both directions for each scheme: rustun as the client dialing
+a gost listener, and gost as the client dialing a rustun listener. `interop.sh`
+drives it; it needs a `gost` binary and `curl`.
+
+Currently passing, both directions: `http`, `socks5`, `socks4`, `ss`
+(aes-256-gcm and chacha20-ietf-poly1305), `relay`, `tls`, `ws`, `wss`, `mtls`,
+`mws`, `mwss`, `quic`.
+
+This is what the unit tests cannot establish. Byte-exact assertions prove a
+codec matches a spec as it was read; only a real peer proves the reading was
+right. Running it found three bugs that every unit test had passed:
+`-F tls://` never sent CONNECT, because an empty protocol was treated as a
+pass-through where gost's AutoConnector uses the HTTP connector; and `-F ss://`
+and `-F relay://` were absent from the chain's connector dispatch entirely.
+
+---
+
+## 28. Implementation Status
 
 This table records the honest state of each gost feature in rustun, audited
 module by module against ginuerzh/gost. It is deliberately conservative: a row
@@ -1465,7 +1486,7 @@ making them cross-implementation rather than self-consistent.
 | FakeTCP, VSOCK | Types only | Need raw sockets and a vsock crate |
 | Socket mark / interface bind | Working on Linux | `-M` / `-I` applied to outbound sockets before connect; no-op elsewhere |
 
-## 28. Module Reference
+## 29. Module Reference
 
 | Module | Source File | Description |
 |--------|-------------|-------------|
@@ -1511,7 +1532,7 @@ making them cross-implementation rather than self-consistent.
 
 ---
 
-## 29. Testing
+## 30. Testing
 
 ### Running Tests
 
@@ -1583,6 +1604,6 @@ The test suite contains 211 tests organized into unit tests (in each module's `#
 
 ---
 
-## 30. License
+## 31. License
 
 This project is a Rust port of [gost](https://github.com/ginuerzh/gost), which is licensed under the MIT License.

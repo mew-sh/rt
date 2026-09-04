@@ -416,12 +416,15 @@ impl RelayConnector {
     /// is deliberately *not* read here: gost's server holds it back until it
     /// has payload to send (relay.go:252-258), so reading it eagerly would
     /// deadlock against a real gost server.
-    pub async fn connect(
+    pub async fn connect<S>(
         &self,
-        mut conn: TcpStream,
+        mut conn: S,
         network: &str,
         address: &str,
-    ) -> Result<RelayConn<TcpStream>, HandlerError> {
+    ) -> Result<RelayConn<S>, HandlerError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         let udp = matches!(network, "udp" | "udp4" | "udp6");
 
         let mut req = Vec::new();
