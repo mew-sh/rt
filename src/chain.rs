@@ -126,7 +126,9 @@ impl Chain {
         options: &ChainOptions,
     ) -> Result<TcpStream, ChainError> {
         // Resolve address if needed
-        let resolved = self.resolve(address, options.resolver.as_ref(), options.hosts.as_ref());
+        let resolved = self
+            .resolve(address, options.resolver.as_ref(), options.hosts.as_ref())
+            .await;
         let target = if resolved.is_empty() {
             address.to_string()
         } else {
@@ -177,30 +179,45 @@ impl Chain {
         Ok(current)
     }
 
-    fn resolve(
+    async fn resolve(
         &self,
         addr: &str,
         resolver: Option<&crate::resolver::Resolver>,
         hosts: Option<&Hosts>,
     ) -> String {
-        if let Some((host, port)) = addr.rsplit_once(':') {
-            // Check hosts table first
-            if let Some(hosts) = hosts {
-                if let Some(ip) = hosts.lookup(host) {
-                    return format!("{}:{}", ip, port);
+        // Bracketed IPv6 literals must not be split on their inner colons.
+        let Ok((host, port)) = split_host_port(addr) else {
+            return addr.to_string();
+        };
+
+        // The hosts table wins over DNS, as in gost (chain.go:223-244).
+        if let Some(hosts) = hosts {
+            if let Some(ip) = hosts.lookup(host) {
+                return join_host_port(&ip.to_string(), port);
+            }
+        }
+
+        if let Some(resolver) = resolver {
+            // Boxed to break the async recursion: a name-server lookup dials
+            // through the chain, which resolves, which may dial again.
+            if let Ok(ips) = Box::pin(resolver.resolve(host)).await {
+                if let Some(ip) = ips.first() {
+                    return join_host_port(&ip.to_string(), port);
                 }
             }
-
-            // Then try resolver
-            if let Some(_resolver) = resolver {
-                // DNS resolution would go here
-                // For now, return the original address
-            }
-
-            addr.to_string()
-        } else {
-            addr.to_string()
         }
+
+        addr.to_string()
+    }
+}
+
+/// Joins a host and port, bracketing an IPv6 literal as Go's
+/// `net.JoinHostPort` does.
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
     }
 }
 
@@ -709,8 +726,8 @@ mod tests {
         assert_eq!(c2.nodes().len(), 1);
     }
 
-    #[test]
-    fn test_chain_resolve_with_hosts() {
+    #[tokio::test]
+    async fn test_chain_resolve_with_hosts() {
         let mut hosts = Hosts::new(vec![]);
         hosts.add_host(crate::hosts::Host::new(
             "10.0.0.1".parse().unwrap(),
@@ -719,15 +736,29 @@ mod tests {
         ));
 
         let c = Chain::empty();
-        let resolved = c.resolve("myhost:80", None, Some(&hosts));
+        let resolved = c.resolve("myhost:80", None, Some(&hosts)).await;
         assert_eq!(resolved, "10.0.0.1:80");
     }
 
-    #[test]
-    fn test_chain_resolve_no_hosts() {
+    #[tokio::test]
+    async fn test_chain_resolve_no_hosts() {
         let c = Chain::empty();
-        let resolved = c.resolve("example.com:443", None, None);
+        let resolved = c.resolve("example.com:443", None, None).await;
         assert_eq!(resolved, "example.com:443");
+    }
+
+    #[tokio::test]
+    async fn test_chain_resolve_ipv6_host_is_bracketed() {
+        let mut hosts = Hosts::new(vec![]);
+        hosts.add_host(crate::hosts::Host::new(
+            "::1".parse().unwrap(),
+            "v6host",
+            vec![],
+        ));
+        let c = Chain::empty();
+        let resolved = c.resolve("v6host:443", None, Some(&hosts)).await;
+        assert_eq!(resolved, "[::1]:443");
+        assert!(resolved.parse::<std::net::SocketAddr>().is_ok());
     }
 
     #[test]

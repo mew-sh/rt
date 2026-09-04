@@ -261,6 +261,24 @@ fn build_handler_options(node: &Node, mut chain: Chain) -> HandlerOptions {
         chain.retries = retries;
     }
 
+    // --- Resolver (?dns=, ?prefer=, ?ip=) ---
+    // Snapshot the chain for the resolver before storing the resolver on it,
+    // so name-server dials route through the chain without a reference cycle.
+    let resolver = node.get("dns").and_then(resolver::Resolver::parse);
+    if let Some(ref r) = resolver {
+        r.init(
+            Some(Arc::new(chain.clone())),
+            timeout,
+            node.get_duration("ttl"),
+            node.get("prefer").unwrap_or(""),
+            node.get("ip").and_then(|s| s.parse::<std::net::IpAddr>().ok()),
+        );
+        if let Some(spec) = node.get("dns") {
+            spawn_period_reload(r.clone(), spec);
+        }
+    }
+    chain.resolver = resolver;
+
     // --- Proxy Agent ---
     let proxy_agent = node.get("proxyAgent").unwrap_or("").to_string();
 
@@ -288,6 +306,23 @@ fn build_handler_options(node: &Node, mut chain: Chain) -> HandlerOptions {
         max_fails: node.get_int("max_fails").max(0) as u32,
         fail_timeout: node.get_duration("fail_timeout"),
     }
+}
+
+/// Starts gost's periodic file-watch reload for a config source, but only when
+/// the source is a real file and it asked for a reload period.
+fn spawn_period_reload<R>(reloader: R, spec: &str)
+where
+    R: reload::Reloader + reload::Stoppable + Send + Sync + 'static,
+{
+    if reloader.period().is_zero() || !std::path::Path::new(spec).is_file() {
+        return;
+    }
+    let path = spec.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = reload::period_reload(&reloader, &path).await {
+            warn!("reload of {} stopped: {}", path, e);
+        }
+    });
 }
 
 /// Load a secrets file into a LocalAuthenticator.
