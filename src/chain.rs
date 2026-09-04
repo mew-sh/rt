@@ -1269,16 +1269,28 @@ mod tests {
         });
 
         match c.dial(&addr.to_string()).await {
-            Ok(_) => {}
+            Ok(_) => {
+                // The dial connected, so the accept must complete. Bound so a
+                // regression here fails the test instead of hanging CI.
+                tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                    .await
+                    .expect("accept did not complete after a successful dial")
+                    .unwrap();
+            }
             Err(ChainError::Io(e))
                 if e.kind() == std::io::ErrorKind::PermissionDenied
                     || e.raw_os_error() == Some(1) =>
             {
                 // EPERM: no CAP_NET_ADMIN. Refusing is the intended behaviour.
+                // Nothing ever reached the listener, so the accept would block
+                // forever — drop it rather than await it.
+                handle.abort();
             }
-            Err(e) => panic!("dial failed for an unexpected reason: {e}"),
+            Err(e) => {
+                handle.abort();
+                panic!("dial failed for an unexpected reason: {e}");
+            }
         }
-        handle.await.ok();
     }
 
     #[tokio::test]
