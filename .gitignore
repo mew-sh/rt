@@ -2,4 +2,5 @@
 /gost
 /.claude
 /examples
-/logs_*
+/logs_*/target-socks/
+/.pi/

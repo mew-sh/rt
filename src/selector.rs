@@ -26,18 +26,79 @@ pub trait Filter: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
 }
 
-/// Default selector implementation.
+/// Default selector implementation: round-robin with no filtering.
 #[derive(Debug)]
-pub struct DefaultSelector;
+pub struct DefaultSelector {
+    counter: AtomicU64,
+}
+
+impl DefaultSelector {
+    pub fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for DefaultSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl NodeSelector for DefaultSelector {
     fn select(&self, nodes: &[Node]) -> Result<Node, SelectError> {
         if nodes.is_empty() {
             return Err(SelectError::NoneAvailable);
         }
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Per-instance, not a process-global `static`: a shared counter makes
+        // every node group in the process advance each other's round-robin.
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
         Ok(nodes[n as usize % nodes.len()].clone())
+    }
+}
+
+/// A selector that applies filters before handing the survivors to a strategy,
+/// mirroring gost's `defaultSelector` (selector.go:29-46). Without this, a
+/// node marked dead is still selected on the very next call.
+#[derive(Debug)]
+pub struct FilterSelector {
+    filters: Vec<Box<dyn Filter>>,
+    strategy: Box<dyn Strategy>,
+}
+
+impl FilterSelector {
+    pub fn new(filters: Vec<Box<dyn Filter>>, strategy: Box<dyn Strategy>) -> Self {
+        Self { filters, strategy }
+    }
+
+    /// The selector gost installs for a forward/chain node group: drop nodes
+    /// with invalid ports, then nodes that have failed too recently.
+    pub fn with_fail_filter(
+        strategy: &str,
+        max_fails: u32,
+        fail_timeout: Duration,
+    ) -> Self {
+        Self::new(
+            vec![
+                Box::new(InvalidFilter),
+                Box::new(FailFilter::new(max_fails, fail_timeout)),
+            ],
+            new_strategy(strategy),
+        )
+    }
+}
+
+impl NodeSelector for FilterSelector {
+    fn select(&self, nodes: &[Node]) -> Result<Node, SelectError> {
+        let mut candidates = nodes.to_vec();
+        for filter in &self.filters {
+            candidates = filter.filter(&candidates);
+            if candidates.is_empty() {
+                return Err(SelectError::NoneAvailable);
+            }
+        }
+        Ok(self.strategy.apply(&candidates))
     }
 }
 
@@ -335,14 +396,69 @@ mod tests {
     #[test]
     fn test_default_selector() {
         let nodes = make_nodes(&["a:1", "b:2"]);
-        let sel = DefaultSelector;
+        let sel = DefaultSelector::new();
         let n = sel.select(&nodes).unwrap();
         assert!(!n.addr.is_empty());
     }
 
     #[test]
     fn test_default_selector_empty() {
-        let sel = DefaultSelector;
+        let sel = DefaultSelector::new();
         assert!(sel.select(&[]).is_err());
+    }
+
+    #[test]
+    fn test_default_selector_counter_is_per_instance() {
+        // A process-global counter made every node group advance each other's
+        // round-robin position.
+        let nodes = make_nodes(&["a:1", "b:2"]);
+        let a = DefaultSelector::new();
+        let b = DefaultSelector::new();
+        assert_eq!(a.select(&nodes).unwrap().addr, "a:1");
+        assert_eq!(b.select(&nodes).unwrap().addr, "a:1");
+        assert_eq!(a.select(&nodes).unwrap().addr, "b:2");
+    }
+
+    #[test]
+    fn test_filter_selector_excludes_dead_nodes() {
+        let nodes = make_nodes(&["good:1", "dead:2"]);
+        let sel = FilterSelector::with_fail_filter("round", 1, Duration::from_secs(30));
+
+        // Fail the second node past max_fails; it must stop being selected.
+        nodes[1].mark_dead();
+
+        for _ in 0..6 {
+            assert_eq!(
+                sel.select(&nodes).unwrap().addr,
+                "good:1",
+                "a node marked dead must be filtered out of selection"
+            );
+        }
+
+        // Once it recovers it comes back into rotation.
+        nodes[1].reset_dead();
+        let picked: std::collections::HashSet<String> =
+            (0..6).map(|_| sel.select(&nodes).unwrap().addr).collect();
+        assert!(picked.contains("dead:2"), "recovered node should return to rotation");
+    }
+
+    #[test]
+    fn test_filter_selector_errors_when_all_nodes_dead() {
+        let nodes = make_nodes(&["a:1", "b:2"]);
+        nodes[0].mark_dead();
+        nodes[1].mark_dead();
+        let sel = FilterSelector::with_fail_filter("round", 1, Duration::from_secs(30));
+        assert!(sel.select(&nodes).is_err());
+    }
+
+    #[test]
+    fn test_invalid_filter_rejects_zero_and_missing_port() {
+        let nodes = make_nodes(&["good:80", "noport", "zero:0"]);
+        let kept: Vec<String> = InvalidFilter
+            .filter(&nodes)
+            .into_iter()
+            .map(|n| n.addr)
+            .collect();
+        assert_eq!(kept, vec!["good:80".to_string()]);
     }
 }

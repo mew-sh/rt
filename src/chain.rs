@@ -12,6 +12,11 @@ pub struct Chain {
     pub retries: usize,
     pub mark: i32,
     pub interface: String,
+    /// Per-listener dial settings, applied by `dial` so every handler picks
+    /// them up without threading ChainOptions through each call site.
+    pub timeout: Duration,
+    pub hosts: Option<Hosts>,
+    pub resolver: Option<crate::resolver::Resolver>,
     node_groups: Vec<NodeGroup>,
     is_route: bool,
 }
@@ -23,6 +28,9 @@ impl Chain {
             retries: 0,
             mark: 0,
             interface: String::new(),
+            timeout: Duration::ZERO,
+            hosts: None,
+            resolver: None,
             node_groups,
             is_route: false,
         }
@@ -33,6 +41,9 @@ impl Chain {
             retries: 0,
             mark: 0,
             interface: String::new(),
+            timeout: Duration::ZERO,
+            hosts: None,
+            resolver: None,
             node_groups: Vec::new(),
             is_route: false,
         }
@@ -69,8 +80,19 @@ impl Chain {
 
     /// Dial connects to the target address through the chain.
     pub async fn dial(&self, address: &str) -> Result<TcpStream, ChainError> {
-        self.dial_with_options(address, &ChainOptions::default())
+        self.dial_with_options(address, &self.default_options())
             .await
+    }
+
+    /// The dial options configured on this chain, so `?timeout=`, `?retry=`,
+    /// `?hosts=` and `?dns=` take effect for every handler.
+    pub fn default_options(&self) -> ChainOptions {
+        ChainOptions {
+            retries: self.retries,
+            timeout: self.timeout,
+            hosts: self.hosts.clone(),
+            resolver: self.resolver.clone(),
+        }
     }
 
     pub async fn dial_with_options(
@@ -78,13 +100,15 @@ impl Chain {
         address: &str,
         options: &ChainOptions,
     ) -> Result<TcpStream, ChainError> {
-        let retries = if self.retries > 0 {
-            self.retries
-        } else if options.retries > 0 {
-            options.retries
-        } else {
-            1
-        };
+        // gost's precedence: a default of 1, overridden by the chain, then
+        // overridden by the per-call option (chain.go:125-131).
+        let mut retries = 1;
+        if self.retries > 0 {
+            retries = self.retries;
+        }
+        if options.retries > 0 {
+            retries = options.retries;
+        }
 
         let mut last_err = ChainError::EmptyChain;
         for _ in 0..retries {
@@ -138,51 +162,16 @@ impl Chain {
             .map_err(|_| ChainError::Timeout)?
             .map_err(ChainError::Io)?;
 
-        // For a simple single-hop chain, we need to do CONNECT through the proxy
-        // This is handled by the connector in the full implementation
-        if nodes.len() == 1 {
-            // Use the first node's protocol to CONNECT to the target
-            match first.protocol.as_str() {
-                "http" => {
-                    return http_connect(conn, &target).await;
-                }
-                "socks5" => {
-                    return socks5_connect(conn, &target).await;
-                }
-                _ => {
-                    // For direct/forward connections, just return the conn to the first node
-                    return Ok(conn);
-                }
-            }
-        }
-
-        // Multi-hop chain: connect through each node
+        // Walk the chain, asking each node to connect to the next one, and the
+        // last node to connect to the real target.
         let mut current = conn;
         for (i, node) in nodes.iter().enumerate() {
-            if i == nodes.len() - 1 {
-                // Last node: connect to the actual target
-                match node.protocol.as_str() {
-                    "http" => {
-                        current = http_connect(current, &target).await?;
-                    }
-                    "socks5" => {
-                        current = socks5_connect(current, &target).await?;
-                    }
-                    _ => {}
-                }
+            let hop_target = if i == nodes.len() - 1 {
+                target.as_str()
             } else {
-                // Intermediate node: connect to the next node
-                let next = &nodes[i + 1];
-                match node.protocol.as_str() {
-                    "http" => {
-                        current = http_connect(current, &next.addr).await?;
-                    }
-                    "socks5" => {
-                        current = socks5_connect(current, &next.addr).await?;
-                    }
-                    _ => {}
-                }
-            }
+                nodes[i + 1].addr.as_str()
+            };
+            current = connect_via(current, node, hop_target).await?;
         }
 
         Ok(current)
@@ -221,59 +210,236 @@ impl Default for Chain {
     }
 }
 
-/// HTTP CONNECT tunnel through a proxy.
-async fn http_connect(mut stream: TcpStream, target: &str) -> Result<TcpStream, ChainError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// Performs the proxy handshake for one hop, using that node's protocol.
+///
+/// An unrecognised protocol is a hard error: returning the raw socket would
+/// hand the caller a connection to the *proxy* while it believes it is talking
+/// to the *target*, silently misrouting the traffic.
+async fn connect_via(
+    stream: TcpStream,
+    node: &Node,
+    target: &str,
+) -> Result<TcpStream, ChainError> {
+    match node.protocol.as_str() {
+        "http" => http_connect(stream, target, node.user.as_ref()).await,
+        "socks5" => socks5_connect(stream, target, node.user.as_ref()).await,
+        "socks4" => socks4_connect(stream, target, node.user.as_ref(), false).await,
+        "socks4a" => socks4_connect(stream, target, node.user.as_ref(), true).await,
+        // "forward"/"direct"/"remote" hand the connection straight through;
+        // the node itself is the endpoint rather than a proxy to traverse.
+        "forward" | "direct" | "remote" | "" => Ok(stream),
+        other => Err(ChainError::ProxyError(format!(
+            "chain node protocol {:?} is not supported as a chain connector",
+            other
+        ))),
+    }
+}
 
-    let req =
-        format!(
-        "CONNECT {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nProxy-Connection: keep-alive\r\n\r\n",
-        target, target, crate::DEFAULT_USER_AGENT
+fn basic_credentials(user: Option<&(String, Option<String>)>) -> Option<String> {
+    use base64::Engine;
+    let (name, pass) = user?;
+    let raw = format!("{}:{}", name, pass.as_deref().unwrap_or(""));
+    Some(base64::engine::general_purpose::STANDARD.encode(raw))
+}
+
+/// Reads exactly one HTTP response head off the wire, leaving any bytes the
+/// peer coalesced after the terminator unread.
+///
+/// Reading into a large buffer would consume payload that belongs to the
+/// tunnelled stream and then drop it, so the head is located with `peek`
+/// first and only those bytes are consumed.
+async fn read_response_head(stream: &mut TcpStream) -> Result<String, ChainError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = vec![0u8; crate::MEDIUM_BUFFER_SIZE];
+    loop {
+        let n = stream.peek(&mut buf).await.map_err(ChainError::Io)?;
+        if n == 0 {
+            return Err(ChainError::ProxyError(
+                "proxy closed the connection during CONNECT".into(),
+            ));
+        }
+        if let Some(pos) = buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+            let head_len = pos + 4;
+            let mut head = vec![0u8; head_len];
+            // Safe to consume: peek proved these bytes are already buffered.
+            stream.read_exact(&mut head).await.map_err(ChainError::Io)?;
+            return Ok(String::from_utf8_lossy(&head).into_owned());
+        }
+        if n == buf.len() {
+            return Err(ChainError::ProxyError(
+                "CONNECT response headers too large".into(),
+            ));
+        }
+    }
+}
+
+/// HTTP CONNECT tunnel through a proxy.
+async fn http_connect(
+    mut stream: TcpStream,
+    target: &str,
+    user: Option<&(String, Option<String>)>,
+) -> Result<TcpStream, ChainError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut req = format!(
+        "CONNECT {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nProxy-Connection: keep-alive\r\n",
+        target,
+        target,
+        crate::DEFAULT_USER_AGENT
     );
+    if let Some(creds) = basic_credentials(user) {
+        req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", creds));
+    }
+    req.push_str("\r\n");
 
     stream
         .write_all(req.as_bytes())
         .await
         .map_err(ChainError::Io)?;
 
-    // Read response
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await.map_err(ChainError::Io)?;
-    let response = String::from_utf8_lossy(&buf[..n]);
-
-    if response.contains("200") {
+    let head = read_response_head(&mut stream).await?;
+    let status_line = head.lines().next().unwrap_or_default();
+    // Check the status token specifically; a substring search for "200" also
+    // matches a 407 whose headers happen to contain those digits.
+    let code = status_line.split_whitespace().nth(1).unwrap_or_default();
+    if code == "200" {
         Ok(stream)
     } else {
         Err(ChainError::ProxyError(format!(
             "HTTP CONNECT failed: {}",
-            response.lines().next().unwrap_or("unknown")
+            status_line
         )))
     }
 }
 
-/// SOCKS5 CONNECT through a proxy.
-async fn socks5_connect(mut stream: TcpStream, target: &str) -> Result<TcpStream, ChainError> {
+/// SOCKS4/4a CONNECT through a proxy.
+async fn socks4_connect(
+    mut stream: TcpStream,
+    target: &str,
+    user: Option<&(String, Option<String>)>,
+    allow_domain: bool,
+) -> Result<TcpStream, ChainError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // SOCKS5 handshake: send greeting
+    let (host, port) = split_host_port(target)?;
+
+    let mut req = vec![0x04, 0x01];
+    req.extend_from_slice(&port.to_be_bytes());
+
+    let domain = match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => {
+            req.extend_from_slice(&ip.octets());
+            None
+        }
+        Err(_) if allow_domain => {
+            // SOCKS4a signals "resolve this name" with an invalid 0.0.0.x address.
+            req.extend_from_slice(&[0, 0, 0, 1]);
+            Some(host)
+        }
+        Err(_) => {
+            return Err(ChainError::ProxyError(
+                "SOCKS4 requires an IPv4 target address; use socks4a for domains".into(),
+            ))
+        }
+    };
+
+    // USERID field, NUL-terminated.
+    if let Some((name, _)) = user {
+        req.extend_from_slice(name.as_bytes());
+    }
+    req.push(0x00);
+
+    if let Some(domain) = domain {
+        req.extend_from_slice(domain.as_bytes());
+        req.push(0x00);
+    }
+
+    stream.write_all(&req).await.map_err(ChainError::Io)?;
+
+    let mut resp = [0u8; 8];
+    stream.read_exact(&mut resp).await.map_err(ChainError::Io)?;
+    if resp[1] != 0x5A {
+        return Err(ChainError::ProxyError(format!(
+            "SOCKS4 connect rejected with code: 0x{:02X}",
+            resp[1]
+        )));
+    }
+    Ok(stream)
+}
+
+/// SOCKS5 CONNECT through a proxy.
+async fn socks5_connect(
+    mut stream: TcpStream,
+    target: &str,
+    user: Option<&(String, Option<String>)>,
+) -> Result<TcpStream, ChainError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const METHOD_NO_AUTH: u8 = 0x00;
+    const METHOD_USER_PASS: u8 = 0x02;
+    const METHOD_NONE_ACCEPTABLE: u8 = 0xFF;
+
+    // Offer user/pass as well when credentials are configured, otherwise a
+    // proxy that requires authentication can never be traversed.
+    let methods: &[u8] = if user.is_some() {
+        &[METHOD_NO_AUTH, METHOD_USER_PASS]
+    } else {
+        &[METHOD_NO_AUTH]
+    };
+    let mut greeting = vec![0x05, methods.len() as u8];
+    greeting.extend_from_slice(methods);
     stream
-        .write_all(&[0x05, 0x01, 0x00]) // ver=5, 1 method, no auth
+        .write_all(&greeting)
         .await
         .map_err(ChainError::Io)?;
 
     let mut buf = [0u8; 2];
     stream.read_exact(&mut buf).await.map_err(ChainError::Io)?;
-    if buf[0] != 0x05 || buf[1] != 0x00 {
+    if buf[0] != 0x05 {
         return Err(ChainError::ProxyError("SOCKS5 handshake failed".into()));
     }
+    match buf[1] {
+        METHOD_NO_AUTH => {}
+        METHOD_USER_PASS => {
+            let (name, pass) = user.ok_or_else(|| {
+                ChainError::ProxyError("proxy requires credentials but none were configured".into())
+            })?;
+            let pass = pass.as_deref().unwrap_or("");
+            if name.len() > 255 || pass.len() > 255 {
+                return Err(ChainError::ProxyError(
+                    "SOCKS5 username/password exceeds 255 bytes".into(),
+                ));
+            }
+            // RFC 1929 username/password sub-negotiation.
+            let mut auth = vec![0x01, name.len() as u8];
+            auth.extend_from_slice(name.as_bytes());
+            auth.push(pass.len() as u8);
+            auth.extend_from_slice(pass.as_bytes());
+            stream.write_all(&auth).await.map_err(ChainError::Io)?;
 
-    // Parse target
-    let (host, port) = target
-        .rsplit_once(':')
-        .ok_or_else(|| ChainError::ProxyError("invalid target address".into()))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| ChainError::ProxyError("invalid port".into()))?;
+            let mut reply = [0u8; 2];
+            stream.read_exact(&mut reply).await.map_err(ChainError::Io)?;
+            if reply[1] != 0x00 {
+                return Err(ChainError::ProxyError(
+                    "SOCKS5 authentication rejected".into(),
+                ));
+            }
+        }
+        METHOD_NONE_ACCEPTABLE => {
+            return Err(ChainError::ProxyError(
+                "SOCKS5 proxy rejected all offered authentication methods".into(),
+            ))
+        }
+        other => {
+            return Err(ChainError::ProxyError(format!(
+                "SOCKS5 proxy selected unsupported auth method 0x{:02X}",
+                other
+            )))
+        }
+    }
+
+    let (host, port) = split_host_port(target)?;
 
     // Send CONNECT request
     let mut req = vec![0x05, 0x01, 0x00]; // ver, cmd=connect, rsv
@@ -323,6 +489,28 @@ async fn socks5_connect(mut stream: TcpStream, target: &str) -> Result<TcpStream
     }
 
     Ok(stream)
+}
+
+/// Splits a `host:port` pair, handling bracketed IPv6 literals the way Go's
+/// `net.SplitHostPort` does.
+fn split_host_port(addr: &str) -> Result<(&str, u16), ChainError> {
+    let (host, port) = if let Some(rest) = addr.strip_prefix('[') {
+        let (host, rest) = rest
+            .split_once(']')
+            .ok_or_else(|| ChainError::ProxyError("unbalanced IPv6 brackets".into()))?;
+        let port = rest
+            .strip_prefix(':')
+            .ok_or_else(|| ChainError::ProxyError("missing port".into()))?;
+        (host, port)
+    } else {
+        addr.rsplit_once(':')
+            .ok_or_else(|| ChainError::ProxyError("invalid target address".into()))?
+    };
+
+    let port: u16 = port
+        .parse()
+        .map_err(|_| ChainError::ProxyError("invalid port".into()))?;
+    Ok((host, port))
 }
 
 /// ChainOptions holds options for Chain.

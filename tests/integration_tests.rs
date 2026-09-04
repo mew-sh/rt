@@ -342,7 +342,7 @@ async fn integration_shadowsocks_plain_cipher() {
     let (target_addr, _target) = start_message_server(b"ss-plain-ok").await;
 
     let handler =
-        rustun::ShadowHandler::new("plain", "testpass", rustun::HandlerOptions::default());
+        rustun::ShadowHandler::new("plain", "testpass", rustun::HandlerOptions::default()).unwrap();
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -352,7 +352,7 @@ async fn integration_shadowsocks_plain_cipher() {
         }
     });
 
-    let connector = rustun::ShadowConnector::new("plain", "testpass");
+    let connector = rustun::ShadowConnector::new("plain", "testpass").unwrap();
     let stream = TcpStream::connect(proxy_addr).await.unwrap();
     let mut conn = connector
         .connect(stream, &target_addr.to_string())

@@ -122,6 +122,7 @@ async fn start_from_cli(
         let mut nodes = Vec::new();
         for f in &cli.forward {
             let node = Node::parse(f)?;
+            ensure_chain_transport_supported(&node)?;
             nodes.push(node);
         }
         let mut chain = Chain::new(nodes);
@@ -159,6 +160,7 @@ async fn start_from_config(
             let mut nodes = Vec::new();
             for ns in &route.chain_nodes {
                 let node = Node::parse(ns)?;
+                ensure_chain_transport_supported(&node)?;
                 nodes.push(node);
             }
             let mut chain = Chain::new(nodes);
@@ -188,7 +190,7 @@ async fn start_from_config(
 // Build HandlerOptions by extracting all query parameters from the node
 // ---------------------------------------------------------------------------
 
-fn build_handler_options(node: &Node, chain: Chain) -> HandlerOptions {
+fn build_handler_options(node: &Node, mut chain: Chain) -> HandlerOptions {
     // --- Authentication ---
     let authenticator: Option<Arc<dyn Authenticator>> = {
         // 1. Try loading from secrets file
@@ -231,16 +233,33 @@ fn build_handler_options(node: &Node, chain: Chain) -> HandlerOptions {
         .and_then(|s| Permissions::parse(s).ok());
 
     // --- Hosts ---
-    let _hosts_opt = node.get("hosts").and_then(|path| {
-        let f = std::fs::File::open(path).ok()?;
+    let hosts = node.get("hosts").and_then(|path| {
+        let f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("failed to open hosts file {}: {}", path, e);
+                return None;
+            }
+        };
         let h = Hosts::new(vec![]);
-        h.reload(f).ok()?;
+        if let Err(e) = h.reload(f) {
+            warn!("failed to parse hosts file {}: {}", path, e);
+            return None;
+        }
         Some(h)
     });
 
     // --- Timeout / Retries ---
     let timeout = node.get_duration("timeout");
     let retries = node.get_int("retry") as usize;
+
+    // Push the per-listener dial settings onto this listener's copy of the
+    // chain so every handler honours them via the plain `chain.dial()` path.
+    chain.hosts = hosts;
+    chain.timeout = timeout;
+    if retries > 0 {
+        chain.retries = retries;
+    }
 
     // --- Proxy Agent ---
     let proxy_agent = node.get("proxyAgent").unwrap_or("").to_string();
@@ -265,6 +284,9 @@ fn build_handler_options(node: &Node, chain: Chain) -> HandlerOptions {
         node: Some(node.clone()),
         host,
         proxy_agent,
+        strategy: node.get("strategy").unwrap_or("round").to_string(),
+        max_fails: node.get_int("max_fails").max(0) as u32,
+        fail_timeout: node.get_duration("fail_timeout"),
     }
 }
 
@@ -277,6 +299,43 @@ fn load_secrets_file(path: &str) -> Result<LocalAuthenticator, std::io::Error> {
     Ok(au)
 }
 
+/// Transports that a listener can actually serve today.
+///
+/// Everything else in gost's transport set (`tls`, `mtls`, `ws`, `mws`, `wss`,
+/// `mwss`, `kcp`, `quic`, `h2`, `h2c`, `ssh`, `ohttp`, `otls`, `obfs4`, `ftcp`,
+/// `vsock`, `tun`, `tap`) has type definitions in this crate but no wiring
+/// between a listener and the handler dispatch, so accepting them would serve
+/// plaintext TCP under an encrypted-looking scheme.
+const SUPPORTED_LISTENER_TRANSPORTS: &[&str] = &["tcp", "udp", "rtcp", "rudp", "dns", "redu"];
+
+fn ensure_listener_transport_supported(
+    node: &Node,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let transport = node.transport.as_str();
+    if transport.is_empty() || SUPPORTED_LISTENER_TRANSPORTS.contains(&transport) {
+        return Ok(());
+    }
+    Err(format!(
+        "listener transport {:?} is not implemented (in {}); \
+         refusing to start rather than fall back to plaintext TCP",
+        transport, node
+    )
+    .into())
+}
+
+fn ensure_chain_transport_supported(node: &Node) -> Result<(), Box<dyn std::error::Error>> {
+    let transport = node.transport.as_str();
+    if transport.is_empty() || transport == "tcp" {
+        return Ok(());
+    }
+    Err(format!(
+        "chain node transport {:?} is not implemented (in {}); \
+         refusing to start rather than dial in cleartext",
+        transport, node
+    )
+    .into())
+}
+
 // ---------------------------------------------------------------------------
 // Server startup -- maps protocol schemes to handlers
 // ---------------------------------------------------------------------------
@@ -286,23 +345,18 @@ async fn run_server(
     chain: Chain,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Refuse to start rather than quietly downgrading to plaintext TCP: a
+    // `-L http+tls://` listener that silently accepts unencrypted traffic is
+    // worse than one that fails to start.
+    ensure_listener_transport_supported(&node)?;
+
     let handler_opts = build_handler_options(&node, chain);
 
-    let addr = node.addr.clone();
+    let addr = node.bind_addr();
     let protocol = node.protocol.clone();
-    let _transport = node.transport.clone();
     let remote = node.remote.clone();
 
-    info!(
-        "{}://{} on {}",
-        if protocol.is_empty() {
-            "auto"
-        } else {
-            &protocol
-        },
-        addr,
-        addr
-    );
+    info!("{} on {}", node, addr);
 
     // Helper: create server, wire cancellation, serve
     macro_rules! serve {
@@ -324,15 +378,27 @@ async fn run_server(
         "http" => serve!(HttpHandler::new(handler_opts)),
         "socks5" | "socks" => serve!(Socks5Handler::new(handler_opts)),
         "socks4" | "socks4a" => serve!(Socks4Handler::new(handler_opts)),
-        "ss" | "ssu" => {
-            let method = node.get("method").unwrap_or("plain");
+        "ss" => {
+            // gost takes the cipher from the userinfo username
+            // (`ss://aes-256-gcm:password@host`), not from a query parameter.
+            let method = node
+                .user
+                .as_ref()
+                .map(|(m, _)| m.as_str())
+                .filter(|m| !m.is_empty())
+                .or_else(|| node.get("method"))
+                .unwrap_or("plain");
             let password = node
                 .user
                 .as_ref()
                 .and_then(|(_, p)| p.clone())
                 .unwrap_or_default();
-            serve!(ShadowHandler::new(method, &password, handler_opts))
+            serve!(ShadowHandler::new(method, &password, handler_opts)?)
         }
+        // `ssu` is shadowsocks over UDP. There is no UDP listener abstraction
+        // yet, and serving it with the TCP handler would silently produce a
+        // TCP shadowsocks server under a UDP scheme.
+        "ssu" => Err("ssu:// (shadowsocks over UDP) is not implemented".into()),
         "http2" => serve!(Http2Handler::new(handler_opts)),
         "relay" => serve!(RelayHandler::new(&remote, handler_opts)),
         "sni" => serve!(SniHandler::new(handler_opts)),

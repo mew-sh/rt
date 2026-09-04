@@ -141,6 +141,13 @@ impl Handler for HttpHandler {
             headers.push(trimmed);
         }
 
+        // The BufReader reads ahead, so bytes the client coalesced after the
+        // header terminator are sitting in its buffer. Dropping the reader
+        // without recovering them loses the request body of a POST/PUT, or the
+        // TLS ClientHello a client sent together with its CONNECT.
+        let pipelined = buf_reader.buffer().to_vec();
+        drop(buf_reader);
+
         // Determine target host
         let host = if method == "CONNECT" {
             target.to_string()
@@ -261,15 +268,24 @@ impl Handler for HttpHandler {
             );
             conn.write_all(resp.as_bytes()).await?;
 
+            // Replay anything the client sent alongside the CONNECT.
+            if !pipelined.is_empty() {
+                cc.write_all(&pipelined).await?;
+            }
+
             info!("[http] {} <-> {}", peer_addr, host);
             transport(conn, cc).await.ok();
             info!("[http] {} >-< {}", peer_addr, host);
         } else {
-            // Forward HTTP request
-            let mut req = format!("{} {} HTTP/1.1\r\n", method, target);
+            // Forward the request. gost emits origin-form for a direct
+            // connection and reserves absolute-form for an upstream proxy
+            // (http.go:316 vs :472); some origin servers reject absolute-form.
+            let request_target = origin_form(target);
+            let mut req = format!("{} {} HTTP/1.1\r\n", method, request_target);
             for header in &headers {
-                if !header.to_lowercase().starts_with("proxy-authorization")
-                    && !header.to_lowercase().starts_with("proxy-connection")
+                let lower = header.to_lowercase();
+                if !lower.starts_with("proxy-authorization")
+                    && !lower.starts_with("proxy-connection")
                 {
                     req.push_str(header);
                     req.push_str("\r\n");
@@ -278,6 +294,10 @@ impl Handler for HttpHandler {
             req.push_str("\r\n");
 
             cc.write_all(req.as_bytes()).await?;
+            // The body begins in whatever the header reader buffered.
+            if !pipelined.is_empty() {
+                cc.write_all(&pipelined).await?;
+            }
 
             info!("[http] {} <-> {}", peer_addr, host);
             transport(conn, cc).await.ok();
@@ -285,6 +305,26 @@ impl Handler for HttpHandler {
         }
 
         Ok(())
+    }
+}
+
+/// Converts an absolute-form request target (`http://host/path?q`) into the
+/// origin form (`/path?q`) an origin server expects. Anything that is not an
+/// absolute URL is passed through unchanged.
+fn origin_form(target: &str) -> String {
+    match url::Url::parse(target) {
+        Ok(url) if url.has_host() => {
+            let mut out = url.path().to_string();
+            if out.is_empty() {
+                out.push('/');
+            }
+            if let Some(q) = url.query() {
+                out.push('?');
+                out.push_str(q);
+            }
+            out
+        }
+        _ => target.to_string(),
     }
 }
 
@@ -489,5 +529,66 @@ mod tests {
         client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
         // Just verify it doesn't hang or panic
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn test_origin_form() {
+        assert_eq!(origin_form("http://example.com/a/b?x=1"), "/a/b?x=1");
+        assert_eq!(origin_form("http://example.com"), "/");
+        // Already origin-form, or not a URL at all: pass through untouched.
+        assert_eq!(origin_form("/already/origin"), "/already/origin");
+        assert_eq!(origin_form("example.com:443"), "example.com:443");
+    }
+
+    /// A POST whose body arrives in the same TCP segment as its headers must
+    /// reach the origin server. The header reader buffers ahead, so those
+    /// bytes were previously dropped along with the reader.
+    #[tokio::test]
+    async fn test_forward_mode_preserves_coalesced_request_body() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+
+        let received = tokio::spawn(async move {
+            let (mut conn, _) = origin.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let mut total = Vec::new();
+            // Read until we have the terminator plus the body.
+            while !total.windows(9).any(|w| w == b"BODY-HERE") {
+                let n = conn.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&total).to_string()
+        });
+
+        let handler = HttpHandler::new(HandlerOptions::default());
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (conn, _) = proxy.accept().await.unwrap();
+            handler.handle(conn).await.ok();
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        // Headers and body written together, as a client sending a small body does.
+        let req = format!(
+            "POST http://{}/submit HTTP/1.1\r\nHost: {}\r\nContent-Length: 9\r\n\r\nBODY-HERE",
+            origin_addr, origin_addr
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), received)
+            .await
+            .expect("origin server did not receive the body")
+            .unwrap();
+
+        assert!(got.contains("BODY-HERE"), "request body was dropped: {:?}", got);
+        assert!(
+            got.starts_with("POST /submit HTTP/1.1"),
+            "expected origin-form request line, got: {:?}",
+            got.lines().next()
+        );
     }
 }

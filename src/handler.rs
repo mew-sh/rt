@@ -31,6 +31,19 @@ pub struct HandlerOptions {
     pub node: Option<Node>,
     pub host: String,
     pub proxy_agent: String,
+    /// Node-selection settings for handlers that load-balance across several
+    /// targets (`?strategy=`, `?max_fails=`, `?fail_timeout=`).
+    pub strategy: String,
+    pub max_fails: u32,
+    pub fail_timeout: Duration,
+}
+
+impl HandlerOptions {
+    /// Whether this listener has credentials configured, in any of the forms
+    /// gost accepts (inline userinfo, a `secrets` file, or both).
+    pub fn requires_auth(&self) -> bool {
+        !self.users.is_empty() || self.authenticator.is_some()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,7 +90,12 @@ impl Handler for AutoHandler {
                 handler.handle(conn).await
             }
             0x04 => {
-                // SOCKS4/4a
+                // SOCKS4(a) has no authentication method, so refuse it outright
+                // when credentials are configured — otherwise an auto listener
+                // with a secrets file would still be an open proxy over SOCKS4.
+                if self.options.requires_auth() {
+                    return Err(HandlerError::AuthFailed);
+                }
                 let handler = crate::socks4::Socks4Handler::new(self.options.clone());
                 handler.handle(conn).await
             }

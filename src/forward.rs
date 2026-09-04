@@ -38,6 +38,16 @@ impl TcpDirectForwardHandler {
             group.add_node(node);
         }
 
+        // Without this, `mark_dead` records a failure that selection ignores,
+        // so a dead target keeps being handed back on every request.
+        group.set_selector(std::sync::Arc::new(
+            crate::selector::FilterSelector::with_fail_filter(
+                &options.strategy,
+                options.max_fails,
+                options.fail_timeout,
+            ),
+        ));
+
         Self {
             raddr: raddr.to_string(),
             group,
@@ -147,6 +157,16 @@ impl UdpDirectForwardHandler {
             node.host = addr.to_string();
             group.add_node(node);
         }
+
+        // Without this, `mark_dead` records a failure that selection ignores,
+        // so a dead target keeps being handed back on every request.
+        group.set_selector(std::sync::Arc::new(
+            crate::selector::FilterSelector::with_fail_filter(
+                &options.strategy,
+                options.max_fails,
+                options.fail_timeout,
+            ),
+        ));
 
         Self {
             raddr: raddr.to_string(),

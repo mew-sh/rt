@@ -1,67 +1,29 @@
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 
 use crate::LARGE_BUFFER_SIZE;
 
-/// Bidirectional data transport between two streams.
+/// Bidirectional data relay between two streams.
 ///
-/// Spawns two copy tasks (A->B and B->A). When either direction finishes
-/// or errors, the other task is aborted to prevent task leaks.
-pub async fn transport<A, B>(a: A, b: B) -> io::Result<()>
+/// Each direction is copied until EOF, at which point only that direction's
+/// write half is shut down; the opposite direction keeps running. This is what
+/// makes half-close work — a client that sends a request and then shuts down
+/// its write side still receives the full response. Returns once both
+/// directions have completed, or on the first error.
+pub async fn transport<A, B>(mut a: A, mut b: B) -> io::Result<(u64, u64)>
 where
-    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: AsyncRead + AsyncWrite + Unpin + Send,
+    B: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let (mut ar, mut aw) = io::split(a);
-    let (mut br, mut bw) = io::split(b);
-
-    let mut t1 = tokio::spawn(async move { copy_buffer(&mut ar, &mut bw).await });
-    let mut t2 = tokio::spawn(async move { copy_buffer(&mut br, &mut aw).await });
-
-    // Wait for either direction to finish, then abort the other.
-    // Without aborting, the losing task runs indefinitely as an orphan
-    // because it holds one half of a split stream that will never receive
-    // data (the peer already closed).
-    tokio::select! {
-        r = &mut t1 => {
-            t2.abort();
-            r.map_err(io::Error::other)??;
-        }
-        r = &mut t2 => {
-            t1.abort();
-            r.map_err(io::Error::other)??;
-        }
-    }
-
-    Ok(())
-}
-
-/// Copy data from reader to writer with a buffer.
-async fn copy_buffer<R, W>(reader: &mut R, writer: &mut W) -> io::Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf = vec![0u8; LARGE_BUFFER_SIZE];
-    let mut total = 0u64;
-
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            writer.shutdown().await.ok();
-            break;
-        }
-        writer.write_all(&buf[..n]).await?;
-        writer.flush().await?;
-        total += n as u64;
-    }
-
-    Ok(total)
+    // copy_bidirectional_with_sizes drives both directions on a single task,
+    // avoiding the two spawns and the Arc<Mutex>-backed `io::split` that the
+    // previous implementation needed.
+    io::copy_bidirectional_with_sizes(&mut a, &mut b, LARGE_BUFFER_SIZE, LARGE_BUFFER_SIZE).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn test_transport() {
@@ -79,7 +41,41 @@ mod tests {
         let n = client_b.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
 
+        // The relay stays open until BOTH directions close, so the b->a side
+        // has to be closed too before it returns. That is the half-close
+        // contract: a client shutting down its write side must still be able
+        // to receive the rest of the response.
+        client_b.shutdown().await.unwrap();
+        drop(client_b);
         handle.await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_transport_half_close_does_not_truncate_response() {
+        let (mut client_a, server_a) = duplex(1024);
+        let (server_b, mut client_b) = duplex(1024);
+
+        tokio::spawn(async move {
+            transport(server_a, server_b).await.ok();
+        });
+
+        // Client sends a request and immediately half-closes, as curl and
+        // many HTTP clients do.
+        client_a.write_all(b"request").await.unwrap();
+        client_a.shutdown().await.unwrap();
+
+        let mut got = vec![0u8; 7];
+        client_b.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"request");
+
+        // The response must still make it back across the relay.
+        let response = b"a-response-sent-after-the-client-half-closed";
+        client_b.write_all(response).await.unwrap();
+        client_b.flush().await.unwrap();
+
+        let mut buf = vec![0u8; response.len()];
+        client_a.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, response, "response was truncated by the relay");
     }
 
     #[tokio::test]
