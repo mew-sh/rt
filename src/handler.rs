@@ -315,10 +315,16 @@ mod tests {
         );
         client.write_all(req.as_bytes()).await.unwrap();
 
-        let mut buf = vec![0u8; 4096];
-        let n = client.read(&mut buf).await.unwrap();
-        let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(response.contains("200"));
+        // One read can return a partial status line, so drain to the blank
+        // line before asserting on the status.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = client.read(&mut byte).await.unwrap();
+            assert_ne!(n, 0, "peer closed before finishing the response head");
+            head.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&head).contains("200"));
     }
 
     #[test]

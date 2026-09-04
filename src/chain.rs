@@ -596,6 +596,37 @@ async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, Ch
                 })?;
             Ok(ProxyConn::layered(Box::new(ws), peer, local))
         }
+        // Like `wss`, `h2` composes TLS underneath rather than opening a
+        // second socket; `h2c` is the cleartext form.
+        "h2" | "h2c" => {
+            let host = hop_hostname(node);
+            let config = crate::h2_transport::H2Config::from_node(node);
+            let peer = stream.peer_addr();
+            let local = stream.local_addr();
+
+            let inner: Box<dyn crate::conn::AsyncStream> = if node.transport == "h2" {
+                let insecure = !node.get_bool("secure");
+                Box::new(
+                    crate::tls_transport::tls_connect_stream(stream, &host, insecure)
+                        .await
+                        .map_err(|e| {
+                            ChainError::ProxyError(format!(
+                                "TLS handshake with {} failed: {}",
+                                host, e
+                            ))
+                        })?,
+                )
+            } else {
+                Box::new(stream)
+            };
+
+            let h2 = crate::h2_transport::h2_connect(inner, &host, &config)
+                .await
+                .map_err(|e| {
+                    ChainError::ProxyError(format!("HTTP/2 tunnel to {} failed: {}", host, e))
+                })?;
+            Ok(ProxyConn::layered(Box::new(h2), peer, local))
+        }
         other => Err(ChainError::ProxyError(format!(
             "chain node transport {:?} is not implemented",
             other

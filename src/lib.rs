@@ -17,6 +17,7 @@ pub mod conn;
 pub mod dns_proxy;
 pub mod forward;
 pub mod ftcp;
+pub mod h2_transport;
 pub mod handler;
 pub mod hosts;
 pub mod http2_transport;

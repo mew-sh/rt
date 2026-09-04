@@ -617,16 +617,23 @@ mod tests {
         );
         client.write_all(req.as_bytes()).await.unwrap();
 
-        // Read response
-        let mut buf = vec![0u8; 4096];
-        let n = client.read(&mut buf).await.unwrap();
-        let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(response.contains("200"));
+        // Read exactly the response head. Reading "some bytes" and assuming
+        // the payload arrives in a later read is a race: nothing stops TCP
+        // from delivering the 200 and the target's first bytes in one segment,
+        // and under a loaded test run it does.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = client.read(&mut byte).await.unwrap();
+            assert_ne!(n, 0, "proxy closed before finishing the response head");
+            head.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&head).contains("200"));
 
-        // Read data from target
-        let mut data_buf = vec![0u8; 4096];
-        let n = client.read(&mut data_buf).await.unwrap();
-        assert_eq!(&data_buf[..n], b"hello from target");
+        // Whatever follows the head is tunnelled payload.
+        let mut data_buf = vec![0u8; b"hello from target".len()];
+        client.read_exact(&mut data_buf).await.unwrap();
+        assert_eq!(&data_buf, b"hello from target");
     }
 
     #[tokio::test]
@@ -757,14 +764,19 @@ mod tests {
         );
         client.write_all(req.as_bytes()).await.unwrap();
 
-        let mut buf = vec![0u8; 4096];
-        let n = client.read(&mut buf).await.unwrap();
-        let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(response.contains("200"));
+        // Same race as in test_http_handler_connect: drain exactly the head.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = client.read(&mut byte).await.unwrap();
+            assert_ne!(n, 0, "proxy closed before finishing the response head");
+            head.push(byte[0]);
+        }
+        assert!(String::from_utf8_lossy(&head).contains("200"));
 
-        let mut data = vec![0u8; 1024];
-        let n = client.read(&mut data).await.unwrap();
-        assert_eq!(&data[..n], b"authenticated-ok");
+        let mut data = vec![0u8; b"authenticated-ok".len()];
+        client.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"authenticated-ok");
     }
 
     #[tokio::test]

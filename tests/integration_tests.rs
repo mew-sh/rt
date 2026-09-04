@@ -81,14 +81,21 @@ async fn integration_http_proxy_connect_tunnel() {
     );
     client.write_all(req.as_bytes()).await.unwrap();
 
-    let mut buf = vec![0u8; 4096];
-    let n = client.read(&mut buf).await.unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
+    // Drain exactly the response head, so the payload read below cannot race
+    // with TCP delivering the 200 and the first payload bytes together.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = client.read(&mut byte).await.unwrap();
+        assert_ne!(n, 0, "proxy closed before finishing the response head");
+        head.push(byte[0]);
+    }
+    let resp = String::from_utf8_lossy(&head);
     assert!(resp.contains("200"), "Expected 200, got: {}", resp);
 
-    let mut data = vec![0u8; 1024];
-    let n = client.read(&mut data).await.unwrap();
-    assert_eq!(&data[..n], b"http-tunnel-ok");
+    let mut data = vec![0u8; b"http-tunnel-ok".len()];
+    client.read_exact(&mut data).await.unwrap();
+    assert_eq!(&data, b"http-tunnel-ok");
 }
 
 #[tokio::test]
