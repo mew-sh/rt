@@ -385,6 +385,7 @@ fn not_found() -> ErrorResponse {
 }
 
 /// Performs the server handshake, serving only `path`.
+#[allow(clippy::result_large_err)]
 async fn ws_upgrade<S>(
     stream: S,
     path: &str,
@@ -394,7 +395,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let want = path.to_string();
-    #[allow(clippy::result_large_err)]
     accept_hdr_async_with_config(
         stream,
         move |request: &Request, response: Response| {

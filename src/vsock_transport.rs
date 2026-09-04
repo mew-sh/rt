@@ -54,7 +54,7 @@ impl VsockTransporter {
         #[cfg(target_os = "linux")]
         {
             info!("[vsock] dialing {}:{}", _vaddr.context_id, _vaddr.port);
-            return Err("VSOCK support requires the vsock crate".into());
+            Err("VSOCK support requires the vsock crate".into())
         }
         #[cfg(not(target_os = "linux"))]
         {

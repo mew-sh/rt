@@ -1,7 +1,7 @@
-/// Platform-specific socket options for outgoing connections.
-///
-/// On Linux, these use real syscalls (SO_MARK, SO_BINDTODEVICE).
-/// On all other platforms, these are no-ops that return Ok(()).
+//! Platform-specific socket options for outgoing connections.
+//!
+//! On Linux, these use real syscalls (SO_MARK, SO_BINDTODEVICE).
+//! On all other platforms, these are no-ops that return Ok(()).
 
 /// Set the SO_MARK socket option on a raw file descriptor.
 ///
