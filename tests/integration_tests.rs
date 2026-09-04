@@ -677,31 +677,26 @@ async fn integration_server_handles_concurrent_connections() {
 // and served unencrypted traffic while reporting success.
 // ---------------------------------------------------------------------------
 
-/// Builds a self-signed identity, or returns None when the platform's TLS
-/// backend cannot construct one from PEM (Windows schannel needs PKCS#12).
-fn self_signed_identity() -> Option<(native_tls::Identity, Vec<u8>)> {
-    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).ok()?;
-    let cert_pem = generated.cert.pem();
-    let key_pem = generated.key_pair.serialize_pem();
-    let identity =
-        native_tls::Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes()).ok()?;
-    Some((identity, cert_pem.into_bytes()))
+/// A TLS client built on native-tls, deliberately a different implementation
+/// from the rustls listener, so the test proves interoperability rather than
+/// self-consistency.
+fn tls_client() -> tokio_native_tls::TlsConnector {
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .unwrap();
+    tokio_native_tls::TlsConnector::from(connector)
 }
 
 #[tokio::test]
 async fn integration_tls_listener_terminates_tls_and_runs_the_handler() {
-    let Some((identity, _cert_pem)) = self_signed_identity() else {
-        eprintln!(
-            "skipping: this platform's TLS backend cannot build an identity from PEM \
-             (expected on Windows/schannel; the Linux build is unaffected)"
-        );
-        return;
-    };
+    let (config, _cert_pem) = rustun::tls_listener::self_signed_config("localhost").unwrap();
 
     let (target_addr, _target) = start_message_server(b"tls-tunnel-ok").await;
 
     let handler = rustun::HttpHandler::new(rustun::HandlerOptions::default());
-    let server = rustun::TlsServer::new("127.0.0.1:0", identity, handler)
+    let server = rustun::TlsServer::new("127.0.0.1:0", config, handler)
         .await
         .unwrap();
     let proxy_addr = server.local_addr().unwrap();
@@ -711,13 +706,7 @@ async fn integration_tls_listener_terminates_tls_and_runs_the_handler() {
     });
 
     // A TLS client speaking HTTP CONNECT over the encrypted channel.
-    let connector = native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()
-        .unwrap();
-    let connector = tokio_native_tls::TlsConnector::from(connector);
-
+    let connector = tls_client();
     let tcp = TcpStream::connect(proxy_addr).await.unwrap();
     let mut tls = connector.connect("localhost", tcp).await.unwrap();
 
@@ -741,13 +730,10 @@ async fn integration_tls_listener_terminates_tls_and_runs_the_handler() {
 
 #[tokio::test]
 async fn integration_tls_listener_rejects_a_plaintext_client() {
-    let Some((identity, _)) = self_signed_identity() else {
-        eprintln!("skipping: platform TLS backend cannot build an identity from PEM");
-        return;
-    };
+    let (config, _) = rustun::tls_listener::self_signed_config("localhost").unwrap();
 
     let handler = rustun::HttpHandler::new(rustun::HandlerOptions::default());
-    let server = rustun::TlsServer::new("127.0.0.1:0", identity, handler)
+    let server = rustun::TlsServer::new("127.0.0.1:0", config, handler)
         .await
         .unwrap();
     let proxy_addr = server.local_addr().unwrap();

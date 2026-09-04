@@ -1399,10 +1399,9 @@ Transports marked *Types only* are **rejected at startup** rather than served as
 plaintext TCP. Earlier versions bound a plain TCP listener for `-L http+tls://`,
 reporting success while accepting unencrypted traffic.
 
-Note on TLS: the end-to-end tests build the server identity from a PEM pair,
-which the Windows schannel backend cannot do, so they skip there. They have not
-been run on Linux yet. Pass a PKCS#12 bundle as `?cert=bundle.p12&key=<password>`
-on Windows.
+The TLS listener is backed by rustls, so the server identity is built the same
+way on every platform. The end-to-end tests drive a native-tls client against it,
+making them cross-implementation rather than self-consistent.
 
 | gost Feature | rustun Status | Notes |
 |--------------|---------------|-------|
@@ -1432,7 +1431,7 @@ on Windows.
 | Load balancing | Working | round/random/fifo with FailFilter and InvalidFilter. FastestFilter absent |
 | Live reload | Working | Driven for secrets, bypass, hosts and dns |
 | Configuration file | Working | gost v2 JSON format |
-| TLS transport (listener) | Working | `-L xxx+tls://` terminates TLS and runs the handler over it; `?cert=`/`?key=` or a generated self-signed cert |
+| TLS transport (listener) | Working | `-L xxx+tls://` terminates TLS via rustls and runs the handler over it; `?cert=`/`?key=` or a generated self-signed cert |
 | TLS transport (chain / `-F`) | Absent | The chain still returns a `TcpStream`, so no transport can be layered mid-chain |
 | mTLS transport | Absent | Needs smux |
 | WS / WSS / MWS / MWSS transport | Types only | Rejected at startup; the default path also differs from gost |

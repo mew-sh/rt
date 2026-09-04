@@ -471,8 +471,8 @@ async fn run_server(
             server.serve().await
         }
         "tls" => {
-            let identity = tls_identity(&node)?;
-            let server = TlsServer::new(&addr, identity, handler).await?;
+            let config = tls_server_config(&node)?;
+            let server = TlsServer::new(&addr, config, handler).await?;
             let server_cancel = server.cancel_token();
             let cancel_clone = cancel.clone();
             tokio::spawn(async move {
@@ -489,33 +489,25 @@ async fn run_server(
     }
 }
 
-/// Builds the TLS identity for a `+tls` listener from `?cert=` and `?key=`,
-/// falling back to a generated self-signed certificate as gost does when no
-/// key pair is configured.
-fn tls_identity(
+/// Builds the TLS configuration for a `+tls` listener from `?cert=` and
+/// `?key=`, falling back to a generated self-signed certificate as gost does
+/// when no key pair is configured.
+fn tls_server_config(
     node: &Node,
-) -> Result<native_tls::Identity, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
     let cert = node.get("cert").unwrap_or("");
     let key = node.get("key").unwrap_or("");
 
     if !cert.is_empty() && !key.is_empty() {
-        return tls_listener::load_identity(cert, key)
-            .map_err(|e| format!("failed to load TLS identity from {} / {}: {}", cert, key, e).into());
+        return tls_listener::server_config_from_files(cert, key)
+            .map_err(|e| format!("failed to load the TLS key pair {} / {}: {}", cert, key, e).into());
     }
 
-    warn!("[tls] no cert/key configured for {}; generating a self-signed certificate", node);
-    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .map_err(|e| format!("failed to generate a self-signed certificate: {}", e))?;
-    let cert_pem = generated.cert.pem();
-    let key_pem = generated.key_pair.serialize_pem();
-
-    native_tls::Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes()).map_err(|e| {
-        format!(
-            "could not build a TLS identity from the generated PEM ({}). \
-             Pass ?cert= and ?key= explicitly; on Windows use a PKCS#12 bundle \
-             as ?cert=bundle.p12&key=<password>",
-            e
-        )
-        .into()
-    })
+    warn!(
+        "[tls] no cert/key configured for {}; generating a self-signed certificate",
+        node
+    );
+    let host = node.get("host").filter(|h| !h.is_empty()).unwrap_or("localhost");
+    let (config, _cert_pem) = tls_listener::self_signed_config(host)?;
+    Ok(config)
 }
