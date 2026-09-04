@@ -57,6 +57,15 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 default = []
 vendored-openssl = ["openssl"]
 
+[profile.release]
+# Cross-crate inlining matters here: the hot path is a chain of thin wrappers
+# (ProxyConn -> SsStream/WsStream/MuxStream -> the socket), each a separate
+# crate-local poll_read/poll_write that only pays off once it can be inlined
+# through. Thin LTO rather than fat keeps the link within this machine's memory.
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

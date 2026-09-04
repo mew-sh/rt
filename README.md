@@ -31,10 +31,11 @@ rustun provides a unified command-line interface for proxying, tunneling, and fo
 23. [Platform Compatibility](#23-platform-compatibility)
 24. [Docker](#24-docker)
 25. [Examples](#25-examples)
-26. [Implementation Status](#26-implementation-status)
-27. [Module Reference](#27-module-reference)
-28. [Testing](#28-testing)
-29. [License](#29-license)
+26. [Build Profile](#26-build-profile)
+27. [Implementation Status](#27-implementation-status)
+28. [Module Reference](#28-module-reference)
+29. [Testing](#29-testing)
+30. [License](#30-license)
 
 ---
 
@@ -1383,7 +1384,22 @@ Shell scripts in the `examples/` directory demonstrate each major feature with r
 
 ---
 
-## 26. Implementation Status
+## 26. Build Profile
+
+The release profile enables thin LTO with a single codegen unit. The hot path is
+a chain of thin wrappers — `ProxyConn` over `SsStream` / `WsStream` /
+`MuxStream` over the socket — each a separate crate-local `poll_read` /
+`poll_write` that only pays off once it can be inlined through. It also strips
+symbols, which takes the binary from 7.9 MB to 5.8 MB.
+
+The cost is build time: a full release build takes about three minutes, and
+`cargo test --release` pays it too. `cargo test` in debug is unaffected, which
+is what CI uses; `cargo build --release` is the shipping path in the Dockerfile
+and the release workflow, so that is where the cost belongs.
+
+---
+
+## 27. Implementation Status
 
 This table records the honest state of each gost feature in rustun, audited
 module by module against ginuerzh/gost. It is deliberately conservative: a row
@@ -1449,7 +1465,7 @@ making them cross-implementation rather than self-consistent.
 | FakeTCP, VSOCK | Types only | Need raw sockets and a vsock crate |
 | Socket mark / interface bind | Working on Linux | `-M` / `-I` applied to outbound sockets before connect; no-op elsewhere |
 
-## 27. Module Reference
+## 28. Module Reference
 
 | Module | Source File | Description |
 |--------|-------------|-------------|
@@ -1495,7 +1511,7 @@ making them cross-implementation rather than self-consistent.
 
 ---
 
-## 28. Testing
+## 29. Testing
 
 ### Running Tests
 
@@ -1567,6 +1583,6 @@ The test suite contains 211 tests organized into unit tests (in each module's `#
 
 ---
 
-## 29. License
+## 30. License
 
 This project is a Rust port of [gost](https://github.com/ginuerzh/gost), which is licensed under the MIT License.
