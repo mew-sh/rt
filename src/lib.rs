@@ -45,6 +45,7 @@ pub mod tls_listener;
 pub mod tls_transport;
 pub mod transport;
 pub mod tuntap;
+pub mod udp;
 pub mod vsock_transport;
 pub mod ws;
 
@@ -81,7 +82,8 @@ pub use ssh::{SshConfig, SshForwardHandler, SshTunnelTransporter};
 pub use tls_listener::TlsServer;
 pub use tuntap::{IpRoute, TapConfig, TapHandler, TunConfig, TunHandler};
 pub use vsock_transport::{VsockAddr, VsockListener, VsockTransporter};
-pub use ws::{WsHandler, WsOptions, WsTransporter, WssTransporter};
+pub use udp::{UdpListenConfig, UdpListener, UdpServer, UdpServerConn};
+pub use ws::{ws_connect_stream, WsOptions, WsServer, WsStream, DEFAULT_WS_PATH};
 
 pub const VERSION: &str = "0.1.0";
 pub const SMALL_BUFFER_SIZE: usize = 2 * 1024;

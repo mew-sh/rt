@@ -342,8 +342,9 @@ fn load_secrets_file(path: &str) -> Result<LocalAuthenticator, std::io::Error> {
 /// `vsock`, `tun`, `tap`) has type definitions in this crate but no wiring
 /// between a listener and the handler dispatch, so accepting them would serve
 /// plaintext TCP under an encrypted-looking scheme.
-const SUPPORTED_LISTENER_TRANSPORTS: &[&str] =
-    &["tcp", "tls", "udp", "rtcp", "rudp", "dns", "redu"];
+const SUPPORTED_LISTENER_TRANSPORTS: &[&str] = &[
+    "tcp", "tls", "ws", "wss", "udp", "rtcp", "rudp", "dns", "redu",
+];
 
 fn ensure_listener_transport_supported(
     node: &Node,
@@ -362,7 +363,7 @@ fn ensure_listener_transport_supported(
 
 fn ensure_chain_transport_supported(node: &Node) -> Result<(), Box<dyn std::error::Error>> {
     let transport = node.transport.as_str();
-    if transport.is_empty() || transport == "tcp" || transport == "tls" {
+    if matches!(transport, "" | "tcp" | "tls" | "ws" | "wss") {
         return Ok(());
     }
     Err(format!(
@@ -459,7 +460,9 @@ async fn run_server(
     let capture_original_dst = matches!(protocol.as_str(), "red" | "redirect");
 
     match node.transport.as_str() {
-        "" | "tcp" | "udp" | "rtcp" | "rudp" | "dns" | "redu" => {
+        // `rudp` and `redu` still ride the TCP listener; they need the UDP
+        // remote-forward and tproxy paths, which are not implemented yet.
+        "" | "tcp" | "rtcp" | "rudp" | "dns" | "redu" => {
             let server = Server::new(&addr, handler)
                 .await?
                 .with_original_dst(capture_original_dst);
@@ -482,11 +485,68 @@ async fn run_server(
             });
             server.serve().await
         }
+        "ws" | "wss" => {
+            let opts = ws_options(&node);
+            let server = if node.transport == "wss" {
+                let config = tls_server_config(&node)?;
+                WsServer::new_tls(&addr, opts, config, handler).await?
+            } else {
+                WsServer::new(&addr, opts, handler).await?
+            };
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
+        // A UDP listener yields one virtual connection per source address, so
+        // the ordinary handlers serve it unchanged (gost's udp.go model).
+        "udp" => {
+            let server = UdpServer::new(&addr, udp_listen_config(&node), handler).await?;
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
         other => Err(format!(
             "listener transport {:?} is not implemented (in {})",
             other, node
         )
         .into()),
+    }
+}
+
+/// WebSocket options from the node's query parameters.
+fn ws_options(node: &Node) -> WsOptions {
+    let mut opts = WsOptions::default();
+    if let Some(path) = node.get("path").filter(|p| !p.is_empty()) {
+        opts.path = path.to_string();
+    }
+    if let Some(agent) = node.get("agent").filter(|a| !a.is_empty()) {
+        opts.user_agent = agent.to_string();
+    }
+    opts.enable_compression = node.get_bool("compression");
+    opts.read_buffer_size = node.get_int("rbuf").max(0) as usize;
+    opts.write_buffer_size = node.get_int("wbuf").max(0) as usize;
+    let timeout = node.get_duration("timeout");
+    if !timeout.is_zero() {
+        opts.handshake_timeout = timeout;
+    }
+    opts
+}
+
+/// UDP listener sizing from `?ttl=`, `?backlog=` and `?queue=`. Zero fields
+/// fall back to gost's defaults inside the listener.
+fn udp_listen_config(node: &Node) -> UdpListenConfig {
+    UdpListenConfig {
+        ttl: node.get_duration("ttl"),
+        backlog: node.get_int("backlog").max(0) as usize,
+        queue_size: node.get_int("queue").max(0) as usize,
     }
 }
 

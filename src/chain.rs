@@ -289,17 +289,7 @@ async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, Ch
             // gost verifies the peer only when `?secure=true` is set
             // (route.go:135); the default is to skip verification.
             let insecure = !node.get_bool("secure");
-            // The SNI name follows `?host=`, else the hop's own hostname.
-            let host = node
-                .get("host")
-                .filter(|h| !h.is_empty())
-                .map(|h| h.to_string())
-                .unwrap_or_else(|| {
-                    split_host_port(&node.addr)
-                        .map(|(h, _)| h.to_string())
-                        .unwrap_or_else(|_| "localhost".to_string())
-                });
-
+            let host = hop_hostname(node);
             let peer = stream.peer_addr();
             let local = stream.local_addr();
             let tls = crate::tls_transport::tls_connect_stream(stream, &host, insecure)
@@ -309,11 +299,72 @@ async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, Ch
                 })?;
             Ok(ProxyConn::layered(Box::new(tls), peer, local))
         }
+        "ws" | "wss" => {
+            let host = hop_hostname(node);
+            let opts = ws_options_for(node);
+            let peer = stream.peer_addr();
+            let local = stream.local_addr();
+
+            // `wss` is TLS then WebSocket, so the two layers compose rather
+            // than each needing their own socket.
+            let inner: Box<dyn crate::conn::AsyncStream> = if node.transport == "wss" {
+                let insecure = !node.get_bool("secure");
+                Box::new(
+                    crate::tls_transport::tls_connect_stream(stream, &host, insecure)
+                        .await
+                        .map_err(|e| {
+                            ChainError::ProxyError(format!(
+                                "TLS handshake with {} failed: {}",
+                                host, e
+                            ))
+                        })?,
+                )
+            } else {
+                Box::new(stream)
+            };
+
+            let ws = crate::ws::ws_connect_stream(inner, &host, "", &opts)
+                .await
+                .map_err(|e| {
+                    ChainError::ProxyError(format!(
+                        "WebSocket handshake with {} failed: {}",
+                        host, e
+                    ))
+                })?;
+            Ok(ProxyConn::layered(Box::new(ws), peer, local))
+        }
         other => Err(ChainError::ProxyError(format!(
             "chain node transport {:?} is not implemented",
             other
         ))),
     }
+}
+
+/// The name to present to a hop's transport: `?host=` when set, else the
+/// hop's own hostname.
+fn hop_hostname(node: &Node) -> String {
+    node.get("host")
+        .filter(|h| !h.is_empty())
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| {
+            split_host_port(&node.addr)
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|_| "localhost".to_string())
+        })
+}
+
+fn ws_options_for(node: &Node) -> crate::ws::WsOptions {
+    let mut opts = crate::ws::WsOptions::default();
+    if let Some(path) = node.get("path").filter(|p| !p.is_empty()) {
+        opts.path = path.to_string();
+    }
+    if let Some(agent) = node.get("agent").filter(|a| !a.is_empty()) {
+        opts.user_agent = agent.to_string();
+    }
+    opts.enable_compression = node.get_bool("compression");
+    opts.read_buffer_size = node.get_int("rbuf").max(0) as usize;
+    opts.write_buffer_size = node.get_int("wbuf").max(0) as usize;
+    opts
 }
 
 /// Performs the proxy handshake for one hop, using that node's protocol.

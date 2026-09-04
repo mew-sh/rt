@@ -1415,11 +1415,12 @@ making them cross-implementation rather than self-consistent.
 | Auto-detect handler | Working | Refuses SOCKS4 when credentials are configured, as gost does |
 | Proxy chain (multi-hop) | Partial | HTTP/SOCKS4/SOCKS4a/SOCKS5 connectors with authentication; unknown protocols are a hard error. No transport layer mid-chain |
 | Shadowsocks (TCP) | Working | Real AEAD: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305. Unknown ciphers fail closed |
-| Shadowsocks over UDP (`ssu`) | Absent | Rejected at startup; needs the UDP listener |
+| Shadowsocks over UDP (`ssu`) | Absent | Rejected at startup; the UDP listener exists, the SS UDP handler does not |
 | Relay protocol | Working | Wire-compatible header, UDP length framing, lazy handshake |
 | TCP direct/remote forwarding | Working | Multi-target with a fail-filter selector |
 | UDP direct forwarding | Partial | Does not route through the chain; no idle expiry |
-| UDP remote forwarding (`rudp`) | Absent | Needs the UDP listener |
+| UDP listener | Working | One virtual connection per source address, with backlog, per-peer queue and TTL expiry, so `-L udp://` is served by the ordinary handlers |
+| UDP remote forwarding (`rudp`) | Absent | Needs the UDP remote-forward listener |
 | DNS proxy | Working | udp, tcp, tls and https modes; multi-upstream with failover |
 | DNS resolver | Working | udp/tcp/DoT/DoH nameservers, cache with TTL, prefer ipv4/ipv6, EDNS0 client subnet. DoT not covered end to end |
 | Hosts file | Working | Exact-match, as in gost v2; live reload |
@@ -1434,7 +1435,8 @@ making them cross-implementation rather than self-consistent.
 | TLS transport (listener) | Working | `-L xxx+tls://` terminates TLS via rustls and runs the handler over it; `?cert=`/`?key=` or a generated self-signed cert |
 | TLS transport (chain / `-F`) | Working | `-F http+tls://proxy:443` layers TLS then speaks the hop's protocol inside it; `?secure=true` enables verification, off by default as in gost |
 | mTLS transport | Absent | Needs smux |
-| WS / WSS / MWS / MWSS transport | Types only | Rejected at startup; the default path also differs from gost |
+| WS / WSS transport | Working | Listener and chain hop; default path `/ws` as in gost. `?compression=`/`?rbuf=` parse but have no effect (tungstenite has no equivalent) |
+| MWS / MWSS transport | Absent | Need smux |
 | KCP transport | Types only | Config parsing only; no KCP crate |
 | QUIC transport | Types only | quinn present but no accept loop and no ALPN |
 | HTTP/2, h2, h2c transport | Types only | The `http2` handler falls back to HTTP/1.1, which gost cannot speak |

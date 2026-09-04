@@ -831,3 +831,110 @@ async fn integration_chain_tls_hop_fails_against_a_plaintext_proxy() {
         "a TLS chain hop must not succeed against a plaintext proxy"
     );
 }
+
+#[tokio::test]
+async fn integration_chain_through_a_websocket_proxy() {
+    // `-F http+ws://proxy/ws`: the hop layers WebSocket, then speaks HTTP
+    // CONNECT inside it. In gost `ws` is a transport carrying an inner proxy
+    // protocol transparently, not a protocol of its own.
+    let (target_addr, _target) = start_message_server(b"chain-over-ws-ok").await;
+
+    let proxy = rustun::WsServer::new(
+        "127.0.0.1:0",
+        rustun::WsOptions::default(),
+        rustun::HttpHandler::new(rustun::HandlerOptions::default()),
+    )
+    .await
+    .unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let cancel = proxy.cancel_token();
+    tokio::spawn(async move {
+        proxy.serve().await.ok();
+    });
+
+    let node = rustun::Node::parse(&format!("http+ws://{}", proxy_addr)).unwrap();
+    assert_eq!(node.transport, "ws");
+
+    let chain = rustun::Chain::new(vec![node]);
+    let mut conn = chain.dial(&target_addr.to_string()).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let n = conn.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"chain-over-ws-ok");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn integration_chain_ws_hop_respects_a_custom_path() {
+    // gost serves only the configured path and 404s anything else, so a
+    // mismatched `?path=` must fail the handshake rather than connect anyway.
+    let mut opts = rustun::WsOptions::default();
+    opts.path = "/tunnel".to_string();
+
+    let proxy = rustun::WsServer::new(
+        "127.0.0.1:0",
+        opts,
+        rustun::HttpHandler::new(rustun::HandlerOptions::default()),
+    )
+    .await
+    .unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let cancel = proxy.cancel_token();
+    tokio::spawn(async move {
+        proxy.serve().await.ok();
+    });
+
+    // The default client path is /ws, which this server does not serve.
+    let node = rustun::Node::parse(&format!("http+ws://{}", proxy_addr)).unwrap();
+    let chain = rustun::Chain::new(vec![node]);
+    assert!(
+        chain.dial("127.0.0.1:1").await.is_err(),
+        "a path mismatch must fail the WebSocket handshake"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn integration_udp_listener_serves_a_handler_per_peer() {
+    // A UDP listener yields one virtual connection per source address, which
+    // is what makes `-L udp://` serveable by the ordinary handlers.
+    use tokio::net::UdpSocket;
+
+    let listener = rustun::UdpListener::bind("127.0.0.1:0", rustun::UdpListenConfig::default())
+        .await
+        .unwrap();
+    let server_addr = listener.local_addr();
+
+    let mut listener = listener;
+    tokio::spawn(async move {
+        while let Some(mut conn) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 1024];
+                while let Ok(n) = conn.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let reply = format!("echo:{}", String::from_utf8_lossy(&buf[..n]));
+                    if conn.write_all(reply.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    // Two distinct client sockets must be served independently.
+    for msg in ["one", "two"] {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(msg.as_bytes(), server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .expect("no reply from the UDP listener")
+            .unwrap();
+        assert_eq!(&buf[..n], format!("echo:{}", msg).as_bytes());
+    }
+}
