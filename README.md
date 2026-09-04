@@ -42,6 +42,38 @@ rt provides a unified command-line interface for proxying, tunneling, and forwar
 
 ## 1. Installation
 
+### Prebuilt Binaries
+
+Every release publishes binaries for Linux (`x86_64`, `i686`, `aarch64`,
+`armv7`), macOS (`x86_64`, `aarch64`), Windows (`x86_64`, `i686`, `aarch64`)
+and FreeBSD (`x86_64`), on the
+[releases page](https://github.com/mew-sh/rt/releases).
+
+```bash
+VERSION=v2.0.0
+TARGET=x86_64-unknown-linux-gnu
+curl -fsSLO https://github.com/mew-sh/rt/releases/download/$VERSION/rt-$VERSION-$TARGET.tar.gz
+curl -fsSLO https://github.com/mew-sh/rt/releases/download/$VERSION/SHA256SUMS.txt
+sha256sum --check --ignore-missing SHA256SUMS.txt
+tar xzf rt-$VERSION-$TARGET.tar.gz
+```
+
+Verify the checksum before running the binary; `SHA256SUMS.txt` covers every
+archive in the release. Windows archives are `.zip` rather than `.tar.gz`.
+
+### Docker
+
+```bash
+docker run --rm -p 8080:8080 ghcr.io/mew-sh/rt:2.0.0 -L http://:8080
+```
+
+Tags are `2.0.0`, `2.0` and `latest`.
+
+> GHCR creates new packages as **private**, even for a public repository, so an
+> anonymous `docker pull` returns `denied` until the package visibility is
+> switched to public once under Packages -> rt -> Package settings. Until then,
+> pull with `docker login ghcr.io`.
+
 ### From Source
 
 ```bash
@@ -593,6 +625,11 @@ rt -L rtcp://:1222/:22 -F forward+ssh://server:2222
 
 **Transport Tunnel**: Used as a general-purpose encrypted transport for proxy protocols.
 
+> **Not implemented.** This is gost's `gost-tunnel` channel. russh has a closed
+> set of channel types and can neither open nor accept it, so `-L ssh://` is
+> rejected at startup. Forward tunnelling above (`forward+ssh`) does work and is
+> interop-tested against gost. See [Implementation Status](#28-implementation-status).
+
 Server:
 
 ```bash
@@ -677,6 +714,12 @@ QUIC nodes can only be used as the first node of a proxy chain.
 
 ### HTTP/2
 
+> **Not implemented.** `-L http2://`, `-L h2://` and `-L h2c://` are rejected at
+> startup rather than quietly served as plaintext TCP. The `http2` handler
+> exists but falls back to HTTP/1.1, which gost cannot speak, so it is not
+> reachable from the CLI. The syntax below is gost's, kept as a reference for
+> what an implementation must accept. See [Implementation Status](#28-implementation-status).
+
 HTTP/2 transport supports two modes:
 
 **Standard Proxy** (`http2`): Acts as an HTTP/2 proxy using the CONNECT method, and is backwards-compatible with HTTPS proxies.
@@ -704,9 +747,17 @@ rt -L :8080 -F h2://server:443
 
 ### FakeTCP
 
+> **Not implemented.** Configuration types exist; there is no raw-socket packet
+> loop. gost spells the scheme `ftcp`, which rt does not recognise as a
+> transport at all. See [Implementation Status](#28-implementation-status).
+
 FakeTCP disguises UDP traffic as TCP packets using raw sockets. This is useful for KCP-based tunnels in environments where UDP traffic is blocked or throttled but TCP is allowed. Requires raw socket capabilities (CAP_NET_RAW on Linux).
 
 ### VSOCK
+
+> **Not implemented.** Address parsing exists; dialling returns an error because
+> no vsock socket crate is linked. `-L vsock://` is rejected at startup. See
+> [Implementation Status](#28-implementation-status).
 
 VSOCK (Virtual Socket) provides communication between a virtual machine and its host. The address format is `contextID:port`. Only available on Linux with the `vsock` kernel module loaded.
 
@@ -1124,6 +1175,13 @@ When both client and server are rt (or gost) instances, SOCKS5 connections negot
 
 Obfuscation transports disguise proxy traffic as benign protocols to evade deep packet inspection (DPI).
 
+> **Not implemented.** None of the three are reachable: `-L http+ohttp://`,
+> `-L http+otls://` and `-L obfs4://` are all rejected at startup rather than
+> served in cleartext. `ohttp` and `otls` have handshake code and round-trip
+> tests, but `otls` has no record framing, so neither is wired to the CLI;
+> obfs4 is types only, and go-gost v3 dropped it too. The syntax below is
+> gost's. See [Implementation Status](#28-implementation-status).
+
 ### HTTP Obfuscation
 
 Disguises the connection as an HTTP WebSocket upgrade. The handshake sends a legitimate-looking HTTP GET request with `Connection: Upgrade` and `Upgrade: websocket` headers, and the server responds with `101 Switching Protocols`.
@@ -1177,6 +1235,12 @@ rt -L :8080 -F "obfs4://server:443?cert=<base64-cert>&iat-mode=0"
 ## 20. TUN/TAP Device
 
 TUN (Layer 3) and TAP (Layer 2) virtual network devices allow rt to operate as a VPN tunnel.
+
+> **Not implemented.** rt parses this configuration and can build the
+> platform-specific commands to configure an *existing* interface, but it
+> creates no device and runs no packet loop, so `-L tun://` and `-L tap://` are
+> rejected at startup. The syntax below is gost's. See
+> [Implementation Status](#28-implementation-status).
 
 ### TUN
 
@@ -1334,6 +1398,20 @@ Platform-specific code is gated using `#[cfg(target_os = "...")]` attributes. No
 ## 24. Docker
 
 A multi-stage `Dockerfile` and a `docker-compose.yml` are provided for containerized deployment.
+
+### Pulling the Published Image
+
+Releases push an image to GitHub Container Registry, tagged `2.0.0`, `2.0` and
+`latest`:
+
+```bash
+docker pull ghcr.io/mew-sh/rt:2.0.0
+```
+
+> GHCR creates new packages as **private**, even for a public repository, so an
+> anonymous `docker pull` returns `denied` until the package visibility is
+> switched to public once under Packages -> rt -> Package settings. Until then,
+> pull with `docker login ghcr.io`.
 
 ### Building the Docker Image
 
@@ -1498,6 +1576,7 @@ making them cross-implementation rather than self-consistent.
 | chain | chain.rs | Proxy chain with multi-hop HTTP CONNECT and SOCKS5 tunneling, retry logic, and DNS resolution |
 | client | client.rs | `Client`, `Connector`, and `Transporter` trait definitions; `DialOptions`, `HandshakeOptions`, `ConnectOptions` |
 | config | config.rs | JSON configuration file parser compatible with gost format; `RouteConfig` and `Config` types |
+| conn | conn.rs | `ProxyConn`, the transport-agnostic connection every handler receives; `from_tcp`/`layered` wrapping, `peek`/`unread` for protocol sniffing, and the captured `original_dst` |
 | dns_proxy | dns_proxy.rs | DNS proxy handler (TCP) and UDP DNS proxy; forwards queries to upstream resolvers |
 | forward | forward.rs | `TcpDirectForwardHandler` and `UdpDirectForwardHandler` with multi-target load balancing |
 | ftcp | ftcp.rs | FakeTCP transport types and configuration (raw socket UDP-over-TCP framing) |
@@ -1507,7 +1586,9 @@ making them cross-implementation rather than self-consistent.
 | http2_transport | http2_transport.rs | HTTP/2 connector, transporter (h2/h2c), and handler |
 | kcp | kcp.rs | KCP transport configuration with JSON parsing, mode presets, and encryption settings |
 | lib | lib.rs | Library crate root; re-exports all public types and constants |
+| main | main.rs | CLI entry point: flag parsing, listener and chain transport gates, protocol dispatch, live-reload wiring |
 | mux | mux.rs | Stream multiplexing: `MuxSession` and `MuxFrame` (encode/decode) for multiplexed transports |
+| mux_transport | mux_transport.rs | smux listener and transporter behind `mtls`/`mws`/`mwss`: `MuxStreamConn`, `MuxHandler`, per-session stream accounting |
 | node | node.rs | `Node` (URL parsing, parameter access), `NodeGroup` (load balancing), `FailMarker` (atomic failure tracking) |
 | obfs | obfs.rs | HTTP obfuscation (WebSocket upgrade simulation), TLS obfuscation (ClientHello/ServerHello), obfs4 types |
 | permissions | permissions.rs | `Permissions` (whitelist/blacklist), `PortRange`, `PortSet`, `StringSet`, `Can()` function |
@@ -1516,7 +1597,7 @@ making them cross-implementation rather than self-consistent.
 | relay | relay.rs | Relay protocol connector and handler with user authentication and address features |
 | reload | reload.rs | `Reloader` and `Stoppable` traits; `period_reload` file-watching function |
 | remote_forward | remote_forward.rs | `TcpRemoteForwardHandler` and `TcpRemoteForwardListener` for reverse port forwarding |
-| resolver | resolver.rs | DNS resolver with IPv4/IPv6 preference; uses system resolver via `tokio::net::lookup_host` |
+| resolver | resolver.rs | DNS resolver over udp/tcp/DoT/DoH nameservers, with a TTL cache, IPv4/IPv6 preference and EDNS0 client subnet; falls back to `tokio::net::lookup_host` |
 | selector | selector.rs | `NodeSelector`, `Strategy` (Round/Random/FIFO), `Filter` (FailFilter/InvalidFilter/FastestFilter) |
 | server | server.rs | TCP server with exponential backoff on accept errors; dispatches to `Handler` |
 | signal | signal.rs | Platform-specific signal handling; SIGUSR1 on Unix, no-op on Windows |
@@ -1526,10 +1607,11 @@ making them cross-implementation rather than self-consistent.
 | socks5 | socks5.rs | SOCKS5 handler (server) and connector (client); auth methods, CONNECT, UDP ASSOCIATE, IPv4/IPv6/domain |
 | ss | ss.rs | Shadowsocks handler, connector, UDP connector; cipher support (AES-GCM, ChaCha20-Poly1305); EVP_BytesToKey |
 | ssh | ssh.rs | SSH tunnel transporter, forward handler, key file parsing, authorized keys parsing |
-| tls_listener | tls_listener.rs | TLS server: wraps TCP listener with TLS acceptor using native-tls |
+| tls_listener | tls_listener.rs | TLS server: wraps a TCP listener with a rustls acceptor, from `?cert=`/`?key=` or a generated self-signed certificate |
 | tls_transport | tls_transport.rs | TLS client: `tls_connect`, `insecure_tls_connector`, `default_tls_connector` |
 | transport | transport.rs | Bidirectional async data relay (`transport` function) with 32KB buffered copy |
 | tuntap | tuntap.rs | TUN/TAP configuration, IP route parsing, IPv4 header parsing, platform-specific device creation commands |
+| udp | udp.rs | `UdpListener` presenting a UDP socket as accepted connections, one per source address, with backlog, per-peer queue and TTL expiry |
 | vsock_transport | vsock_transport.rs | VSOCK address parsing, transporter, and listener (Linux VM communication) |
 | ws | ws.rs | WebSocket transport (WS/WSS), handler with binary message relay, `WsOptions` |
 
@@ -1539,7 +1621,7 @@ making them cross-implementation rather than self-consistent.
 
 ### Running Tests
 
-Run the full test suite (191 unit tests + 20 integration tests = 211 total):
+Run the full test suite (555 unit tests + 33 integration tests = 588 total):
 
 ```bash
 cargo test
@@ -1574,31 +1656,31 @@ cargo test test_chain_dial_through_socks5_proxy
 
 ### Test Categories
 
-The test suite contains 211 tests organized into unit tests (in each module's `#[cfg(test)]` block) and integration tests (in `tests/integration_tests.rs`).
+The test suite contains 588 tests organized into unit tests (in each module's `#[cfg(test)]` block) and integration tests (in `tests/integration_tests.rs`). Passing tests are necessary but not sufficient: see [Interoperability](#27-interoperability) for the checks that run against a real gost binary, which caught three bugs the whole suite had passed.
 
-**Unit Tests** (191): Verify individual functions and data structures in isolation. Examples include node URL parsing, bypass matcher logic, permission rule evaluation, configuration JSON parsing, KCP config mode presets, MuxFrame encode/decode, IPv4 header parsing, VSOCK address parsing, Shadowsocks key derivation, obfuscation handshake building, and platform-specific signal handler creation.
+**Unit Tests** (555): Verify individual functions and data structures in isolation. Examples include node URL parsing, bypass matcher logic, permission rule evaluation, configuration JSON parsing, KCP config mode presets, MuxFrame encode/decode, IPv4 header parsing, VSOCK address parsing, Shadowsocks key derivation, obfuscation handshake building, and platform-specific signal handler creation.
 
-**Integration Tests** (20): Start real TCP listeners and verify end-to-end protocol behavior. These tests create actual server/client pairs communicating over loopback:
+**Integration Tests** (33): Start real listeners and verify end-to-end protocol behavior. These tests create actual server/client pairs communicating over loopback:
 
-- HTTP proxy CONNECT tunnel with data relay
-- HTTP proxy blacklist rejection
-- SOCKS5 CONNECT via IPv4
-- SOCKS5 authentication (success path and rejection path)
-- SOCKS4 CONNECT via IPv4
-- SOCKS4a CONNECT via domain name
-- TCP direct forwarding with echo verification
-- TCP remote forwarding with echo verification
-- Relay protocol with fixed target
-- Shadowsocks plain cipher end-to-end
-- Proxy chain through HTTP proxy
-- Proxy chain through SOCKS5 proxy
-- AutoHandler HTTP detection
-- AutoHandler SOCKS5 detection
-- Bypass blocks matched address via SOCKS5
-- HTTP obfuscation client-server roundtrip
-- TLS obfuscation client-server roundtrip
-- Configuration file parsing with all fields
-- Complex node URL parsing
+- HTTP proxy CONNECT tunnel with data relay; blacklist rejection
+- SOCKS5 CONNECT via IPv4; authentication success and rejection
+- SOCKS4 CONNECT via IPv4; SOCKS4a via domain name
+- TCP direct and remote forwarding with echo verification
+- Relay protocol with a fixed target
+- Shadowsocks end to end; `ssu` relayed through a SOCKS5 chain hop
+- Proxy chains through HTTP, SOCKS5, HTTPS, WebSocket and mtls proxies
+- A chain mtls hop reusing one session; a mux hop rejected unless it is first
+- A chain TLS hop failing against a plaintext proxy, rather than downgrading
+- A chain WebSocket hop honouring a custom path
+- `Chain::dial_udp` direct, tunnelled through SOCKS5, and refusing a hop that
+  cannot carry UDP
+- TLS listener terminating TLS and running the handler; rejecting a plaintext
+  client
+- UDP listener serving one handler invocation per peer
+- AutoHandler HTTP and SOCKS5 detection
+- Bypass blocking a matched address via SOCKS5
+- HTTP and TLS obfuscation round-trips
+- Configuration file parsing with all fields; complex node URL parsing
 - Server handling 10 concurrent connections
 
 **Configuration Tests**: Verify JSON parsing, field defaults, missing files, malformed input, and field compatibility (Mark, Interface, Retries, Routes).
