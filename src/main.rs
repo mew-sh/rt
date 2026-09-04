@@ -361,7 +361,7 @@ fn ensure_listener_transport_supported(
 
 fn ensure_chain_transport_supported(node: &Node) -> Result<(), Box<dyn std::error::Error>> {
     let transport = node.transport.as_str();
-    if transport.is_empty() || transport == "tcp" {
+    if transport.is_empty() || transport == "tcp" || transport == "tls" {
         return Ok(());
     }
     Err(format!(

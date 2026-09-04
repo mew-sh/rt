@@ -620,7 +620,7 @@ async fn dial_tcp_via(
     addr: &str,
     timeout: Duration,
     chain: Option<&Chain>,
-) -> io::Result<TcpStream> {
+) -> io::Result<crate::conn::ProxyConn> {
     match chain {
         Some(c) if !c.is_empty() => {
             let opts = crate::chain::ChainOptions {
@@ -633,7 +633,8 @@ async fn dial_tcp_via(
         }
         _ => tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns dial timeout"))?,
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns dial timeout"))?
+            .map(crate::conn::ProxyConn::from_tcp),
     }
 }
 

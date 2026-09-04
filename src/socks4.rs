@@ -148,7 +148,7 @@ impl Socks4Handler {
         (chain, retries, opts)
     }
 
-    async fn dial_target(&self, target: &str) -> Result<TcpStream, ChainError> {
+    async fn dial_target(&self, target: &str) -> Result<crate::conn::ProxyConn, ChainError> {
         let (chain, retries, opts) = self.dial_setup();
         let mut last_err = ChainError::EmptyChain;
         for i in 0..retries {

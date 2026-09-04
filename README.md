@@ -1432,7 +1432,7 @@ making them cross-implementation rather than self-consistent.
 | Live reload | Working | Driven for secrets, bypass, hosts and dns |
 | Configuration file | Working | gost v2 JSON format |
 | TLS transport (listener) | Working | `-L xxx+tls://` terminates TLS via rustls and runs the handler over it; `?cert=`/`?key=` or a generated self-signed cert |
-| TLS transport (chain / `-F`) | Absent | The chain still returns a `TcpStream`, so no transport can be layered mid-chain |
+| TLS transport (chain / `-F`) | Working | `-F http+tls://proxy:443` layers TLS then speaks the hop's protocol inside it; `?secure=true` enables verification, off by default as in gost |
 | mTLS transport | Absent | Needs smux |
 | WS / WSS / MWS / MWSS transport | Types only | Rejected at startup; the default path also differs from gost |
 | KCP transport | Types only | Config parsing only; no KCP crate |

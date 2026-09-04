@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::debug;
 
+use crate::conn::ProxyConn;
 use crate::hosts::Hosts;
 use crate::node::{Node, NodeGroup};
 
@@ -79,7 +80,11 @@ impl Chain {
     }
 
     /// Dial connects to the target address through the chain.
-    pub async fn dial(&self, address: &str) -> Result<TcpStream, ChainError> {
+    ///
+    /// Returns a [`ProxyConn`] rather than a `TcpStream` so a hop can layer a
+    /// transport (currently TLS) over the socket before the next hop's
+    /// protocol connector runs.
+    pub async fn dial(&self, address: &str) -> Result<ProxyConn, ChainError> {
         self.dial_with_options(address, &self.default_options())
             .await
     }
@@ -99,7 +104,7 @@ impl Chain {
         &self,
         address: &str,
         options: &ChainOptions,
-    ) -> Result<TcpStream, ChainError> {
+    ) -> Result<ProxyConn, ChainError> {
         // gost's precedence: a default of 1, overridden by the chain, then
         // overridden by the per-call option (chain.go:125-131).
         let mut retries = 1;
@@ -124,7 +129,7 @@ impl Chain {
         &self,
         address: &str,
         options: &ChainOptions,
-    ) -> Result<TcpStream, ChainError> {
+    ) -> Result<ProxyConn, ChainError> {
         // Resolve address if needed
         let resolved = self
             .resolve(address, options.resolver.as_ref(), options.hosts.as_ref())
@@ -147,7 +152,7 @@ impl Chain {
                 .await
                 .map_err(|_| ChainError::Timeout)?
                 .map_err(ChainError::Io)?;
-            return Ok(conn);
+            return Ok(ProxyConn::from_tcp(conn));
         }
 
         // Connect through proxy chain
@@ -165,14 +170,17 @@ impl Chain {
             .map_err(ChainError::Io)?;
 
         // Walk the chain, asking each node to connect to the next one, and the
-        // last node to connect to the real target.
-        let mut current = conn;
+        // last node to connect to the real target. Each hop layers its
+        // transport first, then runs its protocol connector, matching gost's
+        // Dial -> Handshake -> Connect ordering (chain.go:286-319).
+        let mut current = ProxyConn::from_tcp(conn);
         for (i, node) in nodes.iter().enumerate() {
             let hop_target = if i == nodes.len() - 1 {
                 target.as_str()
             } else {
                 nodes[i + 1].addr.as_str()
             };
+            current = layer_transport(current, node).await?;
             current = connect_via(current, node, hop_target).await?;
         }
 
@@ -227,16 +235,55 @@ impl Default for Chain {
     }
 }
 
+/// Layers a hop's transport over the connection before its protocol connector
+/// runs, so `-F http+tls://proxy:443` speaks CONNECT inside TLS.
+///
+/// An unimplemented transport is a hard error rather than a silent fall back
+/// to cleartext.
+async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, ChainError> {
+    match node.transport.as_str() {
+        "" | "tcp" => Ok(stream),
+        "tls" => {
+            // gost verifies the peer only when `?secure=true` is set
+            // (route.go:135); the default is to skip verification.
+            let insecure = !node.get_bool("secure");
+            // The SNI name follows `?host=`, else the hop's own hostname.
+            let host = node
+                .get("host")
+                .filter(|h| !h.is_empty())
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| {
+                    split_host_port(&node.addr)
+                        .map(|(h, _)| h.to_string())
+                        .unwrap_or_else(|_| "localhost".to_string())
+                });
+
+            let peer = stream.peer_addr();
+            let local = stream.local_addr();
+            let tls = crate::tls_transport::tls_connect_stream(stream, &host, insecure)
+                .await
+                .map_err(|e| {
+                    ChainError::ProxyError(format!("TLS handshake with {} failed: {}", host, e))
+                })?;
+            Ok(ProxyConn::layered(Box::new(tls), peer, local))
+        }
+        other => Err(ChainError::ProxyError(format!(
+            "chain node transport {:?} is not implemented",
+            other
+        ))),
+    }
+}
+
 /// Performs the proxy handshake for one hop, using that node's protocol.
 ///
 /// An unrecognised protocol is a hard error: returning the raw socket would
 /// hand the caller a connection to the *proxy* while it believes it is talking
 /// to the *target*, silently misrouting the traffic.
 async fn connect_via(
-    stream: TcpStream,
+    stream: ProxyConn,
     node: &Node,
     target: &str,
-) -> Result<TcpStream, ChainError> {
+) -> Result<ProxyConn, ChainError> {
     match node.protocol.as_str() {
         "http" => http_connect(stream, target, node.user.as_ref()).await,
         "socks5" => socks5_connect(stream, target, node.user.as_ref()).await,
@@ -259,31 +306,33 @@ fn basic_credentials(user: Option<&(String, Option<String>)>) -> Option<String> 
     Some(base64::engine::general_purpose::STANDARD.encode(raw))
 }
 
-/// Reads exactly one HTTP response head off the wire, leaving any bytes the
-/// peer coalesced after the terminator unread.
+/// Reads exactly one HTTP response head, pushing back any bytes the peer
+/// coalesced after the terminator.
 ///
-/// Reading into a large buffer would consume payload that belongs to the
-/// tunnelled stream and then drop it, so the head is located with `peek`
-/// first and only those bytes are consumed.
-async fn read_response_head(stream: &mut TcpStream) -> Result<String, ChainError> {
+/// Reading into a large buffer and discarding the remainder would drop payload
+/// belonging to the tunnelled stream, so whatever is read past `\r\n\r\n` is
+/// returned to the connection via `unread`.
+async fn read_response_head(stream: &mut ProxyConn) -> Result<String, ChainError> {
     use tokio::io::AsyncReadExt;
 
-    let mut buf = vec![0u8; crate::MEDIUM_BUFFER_SIZE];
+    let mut acc: Vec<u8> = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+
     loop {
-        let n = stream.peek(&mut buf).await.map_err(ChainError::Io)?;
+        let n = stream.read(&mut chunk).await.map_err(ChainError::Io)?;
         if n == 0 {
             return Err(ChainError::ProxyError(
                 "proxy closed the connection during CONNECT".into(),
             ));
         }
-        if let Some(pos) = buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+        acc.extend_from_slice(&chunk[..n]);
+
+        if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
             let head_len = pos + 4;
-            let mut head = vec![0u8; head_len];
-            // Safe to consume: peek proved these bytes are already buffered.
-            stream.read_exact(&mut head).await.map_err(ChainError::Io)?;
-            return Ok(String::from_utf8_lossy(&head).into_owned());
+            stream.unread(&acc[head_len..]);
+            return Ok(String::from_utf8_lossy(&acc[..head_len]).into_owned());
         }
-        if n == buf.len() {
+        if acc.len() > crate::MEDIUM_BUFFER_SIZE {
             return Err(ChainError::ProxyError(
                 "CONNECT response headers too large".into(),
             ));
@@ -293,10 +342,10 @@ async fn read_response_head(stream: &mut TcpStream) -> Result<String, ChainError
 
 /// HTTP CONNECT tunnel through a proxy.
 async fn http_connect(
-    mut stream: TcpStream,
+    mut stream: ProxyConn,
     target: &str,
     user: Option<&(String, Option<String>)>,
-) -> Result<TcpStream, ChainError> {
+) -> Result<ProxyConn, ChainError> {
     use tokio::io::AsyncWriteExt;
 
     let mut req = format!(
@@ -332,11 +381,11 @@ async fn http_connect(
 
 /// SOCKS4/4a CONNECT through a proxy.
 async fn socks4_connect(
-    mut stream: TcpStream,
+    mut stream: ProxyConn,
     target: &str,
     user: Option<&(String, Option<String>)>,
     allow_domain: bool,
-) -> Result<TcpStream, ChainError> {
+) -> Result<ProxyConn, ChainError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (host, port) = split_host_port(target)?;
@@ -387,10 +436,10 @@ async fn socks4_connect(
 
 /// SOCKS5 CONNECT through a proxy.
 async fn socks5_connect(
-    mut stream: TcpStream,
+    mut stream: ProxyConn,
     target: &str,
     user: Option<&(String, Option<String>)>,
-) -> Result<TcpStream, ChainError> {
+) -> Result<ProxyConn, ChainError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const METHOD_NO_AUTH: u8 = 0x00;

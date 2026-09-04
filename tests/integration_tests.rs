@@ -766,3 +766,68 @@ async fn integration_tls_listener_rejects_a_plaintext_client() {
 
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn integration_chain_through_an_https_proxy() {
+    // The full stack: a chain hop that layers TLS and then speaks HTTP CONNECT
+    // inside it, i.e. `-F http+tls://proxy:443`. Before the chain returned a
+    // transport-agnostic connection this was impossible — it dialled the proxy
+    // in cleartext and the TLS handshake never happened.
+    let (target_addr, _target) = start_message_server(b"chain-over-tls-ok").await;
+
+    let (config, _) = rustun::tls_listener::self_signed_config("localhost").unwrap();
+    let proxy = rustun::TlsServer::new(
+        "127.0.0.1:0",
+        config,
+        rustun::HttpHandler::new(rustun::HandlerOptions::default()),
+    )
+    .await
+    .unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let cancel = proxy.cancel_token();
+    tokio::spawn(async move {
+        proxy.serve().await.ok();
+    });
+
+    let node = rustun::Node::parse(&format!("http+tls://{}", proxy_addr)).unwrap();
+    assert_eq!(node.protocol, "http");
+    assert_eq!(node.transport, "tls");
+
+    let chain = rustun::Chain::new(vec![node]);
+    let mut conn = chain.dial(&target_addr.to_string()).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let n = conn.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"chain-over-tls-ok");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn integration_chain_tls_hop_fails_against_a_plaintext_proxy() {
+    // A `+tls` hop pointed at a cleartext proxy must fail the handshake rather
+    // than silently proceed in the clear, which is what the old chain did.
+    let plain_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = plain_proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        let handler = rustun::HttpHandler::new(rustun::HandlerOptions::default());
+        if let Ok((conn, _)) = plain_proxy.accept().await {
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
+        }
+    });
+
+    let node = rustun::Node::parse(&format!("http+tls://{}", proxy_addr)).unwrap();
+    let chain = rustun::Chain::new(vec![node]);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        chain.dial("127.0.0.1:1"),
+    )
+    .await
+    .expect("the TLS hop should fail rather than hang");
+
+    assert!(
+        result.is_err(),
+        "a TLS chain hop must not succeed against a plaintext proxy"
+    );
+}
