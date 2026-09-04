@@ -1399,6 +1399,11 @@ Transports marked *Types only* are **rejected at startup** rather than served as
 plaintext TCP. Earlier versions bound a plain TCP listener for `-L http+tls://`,
 reporting success while accepting unencrypted traffic.
 
+Note on TLS: the end-to-end tests build the server identity from a PEM pair,
+which the Windows schannel backend cannot do, so they skip there. They have not
+been run on Linux yet. Pass a PKCS#12 bundle as `?cert=bundle.p12&key=<password>`
+on Windows.
+
 | gost Feature | rustun Status | Notes |
 |--------------|---------------|-------|
 | HTTP proxy (CONNECT + forward) | Working | Auth, bypass, whitelist/blacklist; request bodies preserved; origin-form forwarding |
@@ -1427,7 +1432,9 @@ reporting success while accepting unencrypted traffic.
 | Load balancing | Working | round/random/fifo with FailFilter and InvalidFilter. FastestFilter absent |
 | Live reload | Working | Driven for secrets, bypass, hosts and dns |
 | Configuration file | Working | gost v2 JSON format |
-| TLS / mTLS transport | Types only | Rejected at startup |
+| TLS transport (listener) | Working | `-L xxx+tls://` terminates TLS and runs the handler over it; `?cert=`/`?key=` or a generated self-signed cert |
+| TLS transport (chain / `-F`) | Absent | The chain still returns a `TcpStream`, so no transport can be layered mid-chain |
+| mTLS transport | Absent | Needs smux |
 | WS / WSS / MWS / MWSS transport | Types only | Rejected at startup; the default path also differs from gost |
 | KCP transport | Types only | Config parsing only; no KCP crate |
 | QUIC transport | Types only | quinn present but no accept loop and no ALPN |
