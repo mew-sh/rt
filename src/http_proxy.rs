@@ -91,6 +91,151 @@ impl HttpHandler {
             true // No authenticator = allow all
         }
     }
+
+    /// Answers a client that failed authentication.
+    ///
+    /// With probe resistance configured, and unless the request names the
+    /// knocking host, this deliberately does *not* look like a proxy: a bare
+    /// 407 with `Proxy-Authenticate` is exactly the fingerprint the feature
+    /// exists to hide (gost http.go:366-425).
+    async fn deny(
+        &self,
+        mut conn: ProxyConn,
+        host: &str,
+        proxy_connection_keep_alive: bool,
+        request_head: &str,
+        peer_addr: &str,
+    ) -> Result<(), HandlerError> {
+        let knock_matches = !self.options.knocking_host.is_empty()
+            && host
+                .split(':')
+                .next()
+                .unwrap_or(host)
+                .eq_ignore_ascii_case(&self.options.knocking_host);
+
+        let resist = if knock_matches {
+            None
+        } else {
+            ProbeResist::parse(&self.options.probe_resist)
+        };
+
+        let Some(resist) = resist else {
+            // No probe resistance: the ordinary challenge.
+            let mut resp = String::from(
+                "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                 Proxy-Authenticate: Basic realm=\"gost\"\r\n",
+            );
+            // gost only closes the connection when the client asked to keep it
+            // alive, because it cannot serve a second request on the same one.
+            if proxy_connection_keep_alive {
+                resp.push_str("Connection: close\r\nProxy-Connection: close\r\n");
+            }
+            resp.push_str("Content-Length: 0\r\n\r\n");
+            conn.write_all(resp.as_bytes()).await?;
+            return Ok(());
+        };
+
+        match resist {
+            ProbeResist::Code(code) => {
+                conn.write_all(camouflage_headers(code, 0, None).as_bytes())
+                    .await?;
+            }
+            ProbeResist::File(path) => match tokio::fs::read(&path).await {
+                Ok(body) => {
+                    conn.write_all(
+                        camouflage_headers(200, body.len(), Some("text/html")).as_bytes(),
+                    )
+                    .await?;
+                    conn.write_all(&body).await?;
+                }
+                Err(e) => {
+                    debug!("[http] probe_resist file {} unreadable: {}", path, e);
+                    conn.write_all(camouflage_headers(503, 0, None).as_bytes())
+                        .await?;
+                }
+            },
+            ProbeResist::Web(url) => match fetch_decoy(&url).await {
+                Ok(response) => conn.write_all(&response).await?,
+                Err(e) => {
+                    debug!("[http] probe_resist web {} failed: {}", url, e);
+                    conn.write_all(camouflage_headers(503, 0, None).as_bytes())
+                        .await?;
+                }
+            },
+            ProbeResist::Host(addr) => match TcpStream::connect(&addr).await {
+                Ok(mut decoy) => {
+                    // Replay the client's request, then hand the whole
+                    // connection over, so the prober talks to a real server.
+                    decoy.write_all(request_head.as_bytes()).await?;
+                    info!("[http] {} <-> {} : probe_resist forward", peer_addr, addr);
+                    transport(conn, decoy).await.ok();
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!("[http] probe_resist host {} unreachable: {}", addr, e);
+                    conn.write_all(camouflage_headers(503, 0, None).as_bytes())
+                        .await?;
+                }
+            },
+        }
+
+        Ok(())
+    }
+}
+
+/// Rebuilds the request head so it can be replayed to a decoy server.
+fn rebuild_request(method: &str, target: &str, headers: &[String]) -> String {
+    let mut out = format!("{} {} HTTP/1.1\r\n", method, origin_form(target));
+    for header in headers {
+        // The credentials must not reach the decoy.
+        if !header.to_lowercase().starts_with("proxy-") {
+            out.push_str(header);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("\r\n");
+    out
+}
+
+/// Fetches a decoy page and returns the raw response to relay verbatim.
+async fn fetch_decoy(url: &str) -> Result<Vec<u8>, HandlerError> {
+    let url = if url.starts_with("http") {
+        url.to_string()
+    } else {
+        format!("http://{}", url)
+    };
+    let parsed = url::Url::parse(&url)
+        .map_err(|e| HandlerError::Proxy(format!("invalid probe_resist url: {}", e)))?;
+    if parsed.scheme() != "http" {
+        // Relaying an HTTPS decoy would need a TLS client here; gost uses
+        // http.Get, which follows the scheme. Keep it explicit rather than
+        // silently returning the wrong thing.
+        return Err(HandlerError::Proxy(
+            "probe_resist web: only http:// decoys are supported".into(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| HandlerError::Proxy("probe_resist url has no host".into()))?;
+    let port = parsed.port().unwrap_or(80);
+    let mut path = parsed.path().to_string();
+    if let Some(q) = parsed.query() {
+        path.push('?');
+        path.push_str(q);
+    }
+
+    let mut decoy = TcpStream::connect((host, port)).await?;
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nConnection: close\r\n\r\n",
+        if path.is_empty() { "/" } else { &path },
+        host,
+        DEFAULT_USER_AGENT
+    );
+    decoy.write_all(req.as_bytes()).await?;
+
+    let mut body = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut decoy, &mut body).await?;
+    Ok(body)
 }
 
 #[async_trait]
@@ -209,11 +354,14 @@ impl Handler for HttpHandler {
         // Authenticate
         let (u, p, _) = basic_proxy_auth(&proxy_auth);
         if !self.authenticate(&u, &p).await {
-            let resp = "HTTP/1.1 407 Proxy Authentication Required\r\n\
-                        Proxy-Authenticate: Basic realm=\"rustun\"\r\n\
-                        Connection: close\r\n\r\n";
-            conn.write_all(resp.as_bytes()).await?;
-            return Ok(());
+            let keep_alive = headers.iter().any(|h| {
+                let l = h.to_lowercase();
+                l.starts_with("proxy-connection:") && l.contains("keep-alive")
+            });
+            let request_head = rebuild_request(method, target, &headers);
+            return self
+                .deny(conn, &host, keep_alive, &request_head, &peer_addr)
+                .await;
         }
 
         // Connect to target through chain
@@ -301,6 +449,117 @@ impl Handler for HttpHandler {
 
         Ok(())
     }
+}
+
+/// What to answer an unauthenticated client with instead of a 407, so the
+/// listener does not advertise itself as a proxy to a prober.
+///
+/// gost's `probe_resist` (http.go:366-405).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeResist {
+    /// Reply with a bare status code.
+    Code(u16),
+    /// Fetch a decoy site and relay its response.
+    Web(String),
+    /// Hand the whole connection to a decoy server.
+    Host(String),
+    /// Serve a decoy file as text/html.
+    File(String),
+}
+
+impl ProbeResist {
+    /// Parses gost's `<mode>:<value>` form. Anything else disables it, which is
+    /// also what gost does — it only acts when the value splits into two parts.
+    pub fn parse(spec: &str) -> Option<Self> {
+        let (mode, value) = spec.split_once(':')?;
+        if value.is_empty() {
+            return None;
+        }
+        match mode {
+            "code" => value.parse().ok().map(ProbeResist::Code),
+            "web" => Some(ProbeResist::Web(value.to_string())),
+            "host" => Some(ProbeResist::Host(value.to_string())),
+            "file" => Some(ProbeResist::File(value.to_string())),
+            _ => None,
+        }
+    }
+}
+
+/// Formats a UNIX timestamp as an RFC 7231 HTTP date, so the camouflage
+/// response carries a plausible `Date` header.
+pub fn http_date(unix_secs: u64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let days = (unix_secs / 86_400) as i64;
+    let secs_of_day = unix_secs % 86_400;
+    // 1970-01-01 was a Thursday.
+    let weekday = ((days + 4).rem_euclid(7)) as usize;
+
+    // Civil-from-days, shifting the epoch to 0000-03-01 so leap days land at
+    // the end of the cycle.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        DAYS[weekday],
+        d,
+        MONTHS[(m - 1) as usize],
+        y,
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    )
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn status_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        503 => "Service Unavailable",
+        _ => "OK",
+    }
+}
+
+/// Builds the camouflage response headers gost sends when probe resistance
+/// fires: an nginx `Server` banner and a current `Date`, with the
+/// `Proxy-Authenticate` header deliberately absent (http.go:418-425).
+fn camouflage_headers(code: u16, body_len: usize, content_type: Option<&str>) -> String {
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nServer: nginx/1.14.1\r\nDate: {}\r\n",
+        code,
+        status_text(code),
+        http_date(now_unix())
+    );
+    if let Some(ct) = content_type {
+        head.push_str(&format!("Content-Type: {}\r\n", ct));
+    }
+    head.push_str(&format!("Content-Length: {}\r\n", body_len));
+    if code == 200 {
+        head.push_str("Connection: keep-alive\r\n");
+    }
+    head.push_str("\r\n");
+    head
 }
 
 /// Converts an absolute-form request target (`http://host/path?q`) into the
@@ -524,6 +783,143 @@ mod tests {
         client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
         // Just verify it doesn't hang or panic
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    fn auth_opts(probe_resist: &str, knock: &str) -> HandlerOptions {
+        let mut kvs = std::collections::HashMap::new();
+        kvs.insert("u".to_string(), "p".to_string());
+        HandlerOptions {
+            authenticator: Some(std::sync::Arc::new(crate::auth::LocalAuthenticator::new(kvs))),
+            probe_resist: probe_resist.to_string(),
+            knocking_host: knock.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Sends an unauthenticated CONNECT and returns the raw reply.
+    async fn probe(options: HandlerOptions, host: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = HttpHandler::new(options);
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let req = format!("CONNECT {} HTTP/1.1
+Host: {}
+
+", host, host);
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut buf)
+            .await
+            .ok();
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[test]
+    fn test_probe_resist_parse() {
+        assert_eq!(ProbeResist::parse("code:404"), Some(ProbeResist::Code(404)));
+        assert_eq!(
+            ProbeResist::parse("file:/tmp/x.html"),
+            Some(ProbeResist::File("/tmp/x.html".into()))
+        );
+        assert_eq!(
+            ProbeResist::parse("host:1.2.3.4:80"),
+            Some(ProbeResist::Host("1.2.3.4:80".into()))
+        );
+        // gost only acts when the value splits in two; anything else is off.
+        assert_eq!(ProbeResist::parse("code"), None);
+        assert_eq!(ProbeResist::parse(""), None);
+        assert_eq!(ProbeResist::parse("bogus:x"), None);
+        assert_eq!(ProbeResist::parse("code:notanumber"), None);
+    }
+
+    #[test]
+    fn test_http_date_format() {
+        // A known epoch second, so the civil-date arithmetic is pinned.
+        assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[tokio::test]
+    async fn test_without_probe_resist_a_failed_auth_still_challenges() {
+        let resp = probe(auth_opts("", ""), "example.com:443").await;
+        assert!(resp.starts_with("HTTP/1.1 407"), "got: {:?}", resp);
+        assert!(resp.contains("Proxy-Authenticate"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_resist_code_hides_the_proxy() {
+        let resp = probe(auth_opts("code:404", ""), "example.com:443").await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "got: {:?}", resp);
+        // The whole point: nothing may identify this as a proxy.
+        assert!(
+            !resp.contains("Proxy-Authenticate") && !resp.contains("407"),
+            "probe resistance must not leak the proxy challenge: {:?}",
+            resp
+        );
+        assert!(resp.contains("Server: nginx/1.14.1"));
+        assert!(resp.contains("Date: "));
+    }
+
+    #[tokio::test]
+    async fn test_probe_resist_file_serves_a_decoy_page() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("rustun_probe_resist_decoy.html");
+        tokio::fs::write(&path, b"<html>decoy</html>").await.unwrap();
+
+        let spec = format!("file:{}", path.display());
+        let resp = probe(auth_opts(&spec, ""), "example.com:443").await;
+
+        assert!(resp.starts_with("HTTP/1.1 200"), "got: {:?}", resp);
+        assert!(resp.contains("Content-Type: text/html"));
+        assert!(resp.contains("<html>decoy</html>"));
+        assert!(!resp.contains("Proxy-Authenticate"));
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_probe_resist_missing_file_falls_back_to_503() {
+        let resp = probe(auth_opts("file:/no/such/decoy.html", ""), "example.com:443").await;
+        assert!(resp.starts_with("HTTP/1.1 503"), "got: {:?}", resp);
+        assert!(!resp.contains("Proxy-Authenticate"));
+    }
+
+    #[tokio::test]
+    async fn test_knocking_host_bypasses_probe_resistance() {
+        // An operator naming the knock host must still get the real 407.
+        let resp = probe(auth_opts("code:404", "secret.example"), "secret.example:443").await;
+        assert!(resp.starts_with("HTTP/1.1 407"), "got: {:?}", resp);
+        assert!(resp.contains("Proxy-Authenticate"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_resist_host_forwards_to_a_decoy_server() {
+        let decoy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut c, _) = decoy.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = c.read(&mut buf).await.unwrap();
+            // The proxy credentials must not be replayed to the decoy.
+            assert!(!String::from_utf8_lossy(&buf[..n]).contains("Proxy-"));
+            c.write_all(b"HTTP/1.1 200 OK
+Content-Length: 5
+
+hello")
+                .await
+                .unwrap();
+        });
+
+        let spec = format!("host:{}", decoy_addr);
+        let resp = probe(auth_opts(&spec, ""), "example.com:443").await;
+        assert!(resp.contains("hello"), "got: {:?}", resp);
+        assert!(!resp.contains("Proxy-Authenticate"));
     }
 
     #[test]

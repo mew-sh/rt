@@ -51,6 +51,13 @@ pub struct HandlerOptions {
     /// `?fastest_count=`: keep only the N lowest-latency targets. Zero
     /// disables the filter, as in gost.
     pub fastest_count: usize,
+    /// `?probe_resist=`: what to answer an unauthenticated client with, so the
+    /// listener does not identify itself as a proxy. One of `code:<n>`,
+    /// `web:<url>`, `host:<addr>` or `file:<path>`.
+    pub probe_resist: String,
+    /// `?knock=`: a host that bypasses probe resistance, letting an operator
+    /// still reach the real 407.
+    pub knocking_host: String,
 }
 
 impl HandlerOptions {

@@ -1406,7 +1406,7 @@ making them cross-implementation rather than self-consistent.
 | gost Feature | rustun Status | Notes |
 |--------------|---------------|-------|
 | HTTP proxy (CONNECT + forward) | Working | Auth, bypass, whitelist/blacklist; request bodies preserved; origin-form forwarding |
-| HTTP probe_resist / knock | Absent | None of the web/host/file/code modes |
+| HTTP probe_resist / knock | Working | All four modes (`code:`/`web:`/`host:`/`file:`) with nginx camouflage headers; `?knock=` bypass. `web:` supports http:// decoys only |
 | SOCKS5 CONNECT | Working | User/pass auth, IPv4/IPv6/domain, all-zero bound address in the reply |
 | SOCKS5 UDP ASSOCIATE | Working | Real relay socket, per-datagram ACL, fragments dropped, torn down with the control connection |
 | SOCKS5 BIND | Working | Two-reply sequence |
