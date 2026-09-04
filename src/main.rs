@@ -341,7 +341,8 @@ fn load_secrets_file(path: &str) -> Result<LocalAuthenticator, std::io::Error> {
 /// `vsock`, `tun`, `tap`) has type definitions in this crate but no wiring
 /// between a listener and the handler dispatch, so accepting them would serve
 /// plaintext TCP under an encrypted-looking scheme.
-const SUPPORTED_LISTENER_TRANSPORTS: &[&str] = &["tcp", "udp", "rtcp", "rudp", "dns", "redu"];
+const SUPPORTED_LISTENER_TRANSPORTS: &[&str] =
+    &["tcp", "tls", "udp", "rtcp", "rudp", "dns", "redu"];
 
 fn ensure_listener_transport_supported(
     node: &Node,
@@ -394,21 +395,20 @@ async fn run_server(
     info!("{} on {}", node, addr);
 
     // Helper: create server, wire cancellation, serve
+    // Boxes a handler so every arm of the protocol match has one type.
     macro_rules! serve {
-        ($handler:expr) => {{
-            let server = Server::new(&addr, $handler).await?;
-            // Wire global cancel into the server's own cancel token
-            let server_cancel = server.cancel_token();
-            let cancel_clone = cancel.clone();
-            tokio::spawn(async move {
-                cancel_clone.cancelled().await;
-                server_cancel.cancel();
-            });
-            server.serve().await
-        }};
+        ($handler:expr) => {
+            Box::new($handler) as Box<dyn Handler>
+        };
+        ($handler:expr, $_original_dst:expr) => {
+            Box::new($handler) as Box<dyn Handler>
+        };
     }
 
-    match protocol.as_str() {
+    // Protocol picks the handler; transport picks the listener. Keeping them
+    // separate is what lets `-L http+tls://` terminate TLS and then run the
+    // ordinary HTTP handler over the decrypted stream.
+    let handler: Box<dyn Handler> = match protocol.as_str() {
         // --- Proxy protocols ---
         "http" => serve!(HttpHandler::new(handler_opts)),
         "socks5" | "socks" => serve!(Socks5Handler::new(handler_opts)),
@@ -433,7 +433,7 @@ async fn run_server(
         // `ssu` is shadowsocks over UDP. There is no UDP listener abstraction
         // yet, and serving it with the TCP handler would silently produce a
         // TCP shadowsocks server under a UDP scheme.
-        "ssu" => Err("ssu:// (shadowsocks over UDP) is not implemented".into()),
+        "ssu" => return Err("ssu:// (shadowsocks over UDP) is not implemented".into()),
         "http2" => serve!(Http2Handler::new(handler_opts)),
         "relay" => serve!(RelayHandler::new(&remote, handler_opts)),
         "sni" => serve!(SniHandler::new(handler_opts)),
@@ -441,7 +441,7 @@ async fn run_server(
         "udp" | "rudp" => serve!(UdpDirectForwardHandler::new(&remote, handler_opts)),
         "rtcp" => serve!(TcpRemoteForwardHandler::new(&remote, handler_opts)),
         "dns" | "dot" | "doh" => serve!(DnsHandler::new(&remote, handler_opts)),
-        "red" | "redirect" => serve!(TcpRedirectHandler::new(handler_opts)),
+        "red" | "redirect" => serve!(TcpRedirectHandler::new(handler_opts), true),
         "redu" | "redirectu" => serve!(redirect::UdpRedirectHandler::new(handler_opts)),
         "forward" => serve!(SshForwardHandler::new(handler_opts, SshConfig::default())),
         _ => {
@@ -451,5 +451,71 @@ async fn run_server(
                 serve!(handler::AutoHandler::new(handler_opts))
             }
         }
+    };
+
+    // Only a transparent proxy needs the pre-NAT destination, and it has to be
+    // read from the raw socket before the stream is boxed.
+    let capture_original_dst = matches!(protocol.as_str(), "red" | "redirect");
+
+    match node.transport.as_str() {
+        "" | "tcp" | "udp" | "rtcp" | "rudp" | "dns" | "redu" => {
+            let server = Server::new(&addr, handler)
+                .await?
+                .with_original_dst(capture_original_dst);
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
+        "tls" => {
+            let identity = tls_identity(&node)?;
+            let server = TlsServer::new(&addr, identity, handler).await?;
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
+        other => Err(format!(
+            "listener transport {:?} is not implemented (in {})",
+            other, node
+        )
+        .into()),
     }
+}
+
+/// Builds the TLS identity for a `+tls` listener from `?cert=` and `?key=`,
+/// falling back to a generated self-signed certificate as gost does when no
+/// key pair is configured.
+fn tls_identity(
+    node: &Node,
+) -> Result<native_tls::Identity, Box<dyn std::error::Error + Send + Sync>> {
+    let cert = node.get("cert").unwrap_or("");
+    let key = node.get("key").unwrap_or("");
+
+    if !cert.is_empty() && !key.is_empty() {
+        return tls_listener::load_identity(cert, key)
+            .map_err(|e| format!("failed to load TLS identity from {} / {}: {}", cert, key, e).into());
+    }
+
+    warn!("[tls] no cert/key configured for {}; generating a self-signed certificate", node);
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|e| format!("failed to generate a self-signed certificate: {}", e))?;
+    let cert_pem = generated.cert.pem();
+    let key_pem = generated.key_pair.serialize_pem();
+
+    native_tls::Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes()).map_err(|e| {
+        format!(
+            "could not build a TLS identity from the generated PEM ({}). \
+             Pass ?cert= and ?key= explicitly; on Windows use a PKCS#12 bundle \
+             as ?cert=bundle.p12&key=<password>",
+            e
+        )
+        .into()
+    })
 }

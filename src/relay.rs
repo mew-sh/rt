@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::node::{Node, NodeGroup};
 use crate::permissions::Can;
@@ -514,11 +515,8 @@ impl RelayHandler {
 
 #[async_trait]
 impl Handler for RelayHandler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
 
         // Read request header
         let mut header = [0u8; RELAY_HEADER_LEN];
@@ -698,7 +696,10 @@ fn parse_relay_addr(data: &[u8]) -> (String, u16) {
     }
 }
 
-async fn send_relay_reply(conn: &mut TcpStream, status: u8) -> Result<(), HandlerError> {
+async fn send_relay_reply<W: AsyncWrite + Unpin + ?Sized>(
+    conn: &mut W,
+    status: u8,
+) -> Result<(), HandlerError> {
     // version, status, then a 16-bit feature length of zero.
     let reply = [RELAY_VERSION1, status, 0x00, 0x00];
     conn.write_all(&reply).await?;
@@ -743,7 +744,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Use RelayConnector
@@ -814,7 +815,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Send relay request with no auth
@@ -932,7 +933,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let connector = RelayConnector::new(Some(("user".into(), Some("pass".into()))));
@@ -1252,7 +1253,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();

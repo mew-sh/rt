@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::transport::transport;
 
@@ -81,11 +82,8 @@ impl Http2Handler {
 
 #[async_trait]
 impl Handler for Http2Handler {
-    async fn handle(&self, conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
 
         info!("[http2] {} connected", peer_addr);
 
@@ -167,7 +165,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();

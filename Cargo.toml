@@ -57,3 +57,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Needed by the TLS transport integration tests, which drive a real TLS client
+# against the listener. Integration tests cannot reach the crate's own deps.
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+rcgen = "0.13"

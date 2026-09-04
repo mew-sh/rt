@@ -14,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::transport::transport;
 
@@ -491,11 +492,8 @@ impl ShadowHandler {
 
 #[async_trait]
 impl Handler for ShadowHandler {
-    async fn handle(&self, conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
 
         let mut stream = SsStream::new(conn, self.cipher.clone(), self.key.clone());
 
@@ -709,7 +707,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Connect as SS client (send address header then read data)

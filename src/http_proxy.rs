@@ -3,6 +3,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use crate::conn::ProxyConn;
 use crate::handler::{basic_proxy_auth, Handler, HandlerError, HandlerOptions};
 use crate::permissions::Can;
 use crate::transport::transport;
@@ -94,15 +95,9 @@ impl HttpHandler {
 
 #[async_trait]
 impl Handler for HttpHandler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-        let local_addr = conn
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
+        let local_addr = conn.local_addr_str();
 
         // Read the HTTP request
         let mut buf_reader = BufReader::new(&mut conn);
@@ -352,7 +347,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Connect to proxy and issue CONNECT
@@ -394,7 +389,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -425,7 +420,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -451,7 +446,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -491,7 +486,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -522,7 +517,7 @@ mod tests {
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
             // Malformed request should not panic
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -568,7 +563,7 @@ mod tests {
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();

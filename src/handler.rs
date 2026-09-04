@@ -2,18 +2,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::net::TcpStream;
 
 use crate::auth::Authenticator;
+use crate::conn::ProxyConn;
 use crate::bypass::Bypass;
 use crate::chain::Chain;
 use crate::node::Node;
 use crate::permissions::Permissions;
 
 /// Handler is a proxy server handler.
+///
+/// Takes a [`ProxyConn`] rather than a `TcpStream` so the same handler can
+/// serve a raw socket, a TLS session, or any other transport.
 #[async_trait]
 pub trait Handler: Send + Sync + 'static {
-    async fn handle(&self, conn: TcpStream) -> Result<(), HandlerError>;
+    async fn handle(&self, conn: ProxyConn) -> Result<(), HandlerError>;
+}
+
+/// Lets a listener hold a `Box<dyn Handler>`, so protocol selection and
+/// transport selection can be decided independently of each other.
+#[async_trait]
+impl Handler for Box<dyn Handler> {
+    async fn handle(&self, conn: ProxyConn) -> Result<(), HandlerError> {
+        (**self).handle(conn).await
+    }
 }
 
 /// HandlerOptions describes the options for Handler.
@@ -73,7 +85,7 @@ impl AutoHandler {
 
 #[async_trait]
 impl Handler for AutoHandler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
         let mut peek_buf = [0u8; 1];
         let n = conn.peek(&mut peek_buf).await?;
         if n == 0 {
@@ -206,7 +218,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Send SOCKS5 greeting (version byte 0x05)
@@ -240,7 +252,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Send SOCKS4 CONNECT (version byte 0x04)
@@ -282,7 +294,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Send HTTP CONNECT (starts with 'C' = 0x43, not 0x04 or 0x05)

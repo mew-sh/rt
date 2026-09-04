@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::transport::transport;
 
@@ -102,11 +103,8 @@ impl SshForwardHandler {
 
 #[async_trait]
 impl Handler for SshForwardHandler {
-    async fn handle(&self, conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
 
         info!("[ssh] {} connected", peer_addr);
 

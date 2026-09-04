@@ -3,6 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info};
 
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::node::{Node, NodeGroup};
 use crate::transport::transport;
@@ -38,7 +39,7 @@ impl TcpRemoteForwardHandler {
 
 #[async_trait]
 impl Handler for TcpRemoteForwardHandler {
-    async fn handle(&self, conn: TcpStream) -> Result<(), HandlerError> {
+    async fn handle(&self, conn: ProxyConn) -> Result<(), HandlerError> {
         let retries = if self.options.retries > 0 {
             self.options.retries
         } else {
@@ -178,7 +179,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Connect to proxy and send data

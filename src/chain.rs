@@ -650,7 +650,7 @@ mod tests {
             let handler =
                 crate::http_proxy::HttpHandler::new(crate::handler::HandlerOptions::default());
             let (conn, _) = proxy_listener.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(crate::conn::ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Create chain with the HTTP proxy
@@ -684,7 +684,7 @@ mod tests {
             let handler =
                 crate::socks5::Socks5Handler::new(crate::handler::HandlerOptions::default());
             let (conn, _) = proxy_listener.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(crate::conn::ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Create chain with the SOCKS5 proxy

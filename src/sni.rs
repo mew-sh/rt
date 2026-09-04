@@ -1,14 +1,21 @@
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::permissions::Can;
 use crate::transport::transport;
 
 // TLS record type for Handshake
 const TLS_HANDSHAKE: u8 = 0x16;
+
+/// Bytes of the TLS record header: type(1) + version(2) + length(2).
+const TLS_RECORD_HEADER_LEN: usize = 5;
+
+/// Upper bound on the ClientHello we buffer before giving up on finding a
+/// server name, matching the fixed 4096-byte peek this used to do.
+const MAX_CLIENT_HELLO: usize = 4096;
 
 /// SNI proxy handler - routes based on TLS SNI or HTTP Host header.
 pub struct SniHandler {
@@ -23,14 +30,14 @@ impl SniHandler {
 
 #[async_trait]
 impl Handler for SniHandler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
 
-        // Peek first bytes to detect protocol
-        let mut peek_buf = [0u8; 5];
+        // Peek the first byte to detect the protocol. `ProxyConn::peek` fills
+        // the whole buffer before returning, so ask for exactly the one byte
+        // the check below reads rather than a speculative block that may never
+        // arrive.
+        let mut peek_buf = [0u8; 1];
         let n = conn.peek(&mut peek_buf).await?;
         if n == 0 {
             return Err(HandlerError::Io(std::io::Error::new(
@@ -40,8 +47,27 @@ impl Handler for SniHandler {
         }
 
         if peek_buf[0] == TLS_HANDSHAKE {
-            // TLS - extract SNI from ClientHello
-            let mut buf = vec![0u8; 4096];
+            // TLS - extract SNI from ClientHello. The record header carries the
+            // exact ClientHello length, so peek that first and then ask for
+            // precisely the record: peeking a fixed 4096 bytes would block on a
+            // client that has nothing more to send until the server replies.
+            let mut record_head = [0u8; TLS_RECORD_HEADER_LEN];
+            if conn.peek(&mut record_head).await? < TLS_RECORD_HEADER_LEN {
+                return Err(HandlerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated TLS record header",
+                )));
+            }
+            let record_len = u16::from_be_bytes([record_head[3], record_head[4]]) as usize;
+            let want = TLS_RECORD_HEADER_LEN + record_len;
+            if want > MAX_CLIENT_HELLO {
+                // `extract_sni` needs the whole record, so a record this large
+                // could never yield a server name; fail now rather than wait
+                // for bytes that would be useless anyway.
+                return Err(HandlerError::Proxy("SNI: ClientHello too large".into()));
+            }
+
+            let mut buf = vec![0u8; want];
             let n = conn.peek(&mut buf).await?;
             let buf = &buf[..n];
 

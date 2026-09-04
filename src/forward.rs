@@ -3,6 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::{debug, info};
 
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::node::{Node, NodeGroup};
 use crate::transport::transport;
@@ -58,15 +59,9 @@ impl TcpDirectForwardHandler {
 
 #[async_trait]
 impl Handler for TcpDirectForwardHandler {
-    async fn handle(&self, conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-        let local_addr = conn
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
+        let local_addr = conn.local_addr_str();
 
         info!("[tcp] {} - {}", peer_addr, local_addr);
 
@@ -178,12 +173,9 @@ impl UdpDirectForwardHandler {
 
 #[async_trait]
 impl Handler for UdpDirectForwardHandler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
         // UDP forwarding over TCP - read from TCP, forward as UDP
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+        let peer_addr = conn.peer_addr_str();
 
         info!("[udp] {} - forwarding to {}", peer_addr, self.raddr);
 
@@ -268,7 +260,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Connect to forward proxy

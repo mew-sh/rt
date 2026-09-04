@@ -70,7 +70,7 @@ async fn integration_http_proxy_connect_tunnel() {
     tokio::spawn(async move {
         let handler = rustun::HttpHandler::new(rustun::HandlerOptions::default());
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -104,7 +104,7 @@ async fn integration_http_proxy_rejects_blacklisted_host() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -134,7 +134,7 @@ async fn integration_socks5_connect_ipv4() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -170,7 +170,7 @@ async fn integration_socks5_auth_success_and_failure() {
                     ..Default::default()
                 });
                 tokio::spawn(async move {
-                    let _ = h.handle(conn).await;
+                    let _ = h.handle(rustun::ProxyConn::from_tcp(conn)).await;
                 });
             }
         }
@@ -208,7 +208,7 @@ async fn integration_socks4_connect() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -234,7 +234,7 @@ async fn integration_socks4a_domain_connect() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -268,7 +268,7 @@ async fn integration_tcp_direct_forward_echo() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -293,7 +293,7 @@ async fn integration_tcp_remote_forward_echo() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -320,7 +320,7 @@ async fn integration_relay_with_target() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -348,7 +348,7 @@ async fn integration_shadowsocks_plain_cipher() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -379,7 +379,7 @@ async fn integration_chain_through_http_proxy() {
     tokio::spawn(async move {
         let handler = rustun::HttpHandler::new(rustun::HandlerOptions::default());
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -403,7 +403,7 @@ async fn integration_chain_through_socks5_proxy() {
     tokio::spawn(async move {
         let handler = rustun::Socks5Handler::new(rustun::HandlerOptions::default());
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -430,7 +430,7 @@ async fn integration_auto_handler_detects_http() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -454,7 +454,7 @@ async fn integration_auto_handler_detects_socks5() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -488,7 +488,7 @@ async fn integration_bypass_blocks_matched_address() {
 
     tokio::spawn(async move {
         if let Ok((conn, _)) = proxy_listener.accept().await {
-            let _ = handler.handle(conn).await;
+            let _ = handler.handle(rustun::ProxyConn::from_tcp(conn)).await;
         }
     });
 
@@ -629,7 +629,10 @@ async fn integration_server_handles_concurrent_connections() {
 
     #[async_trait::async_trait]
     impl Handler for CounterHandler {
-        async fn handle(&self, mut conn: TcpStream) -> Result<(), rustun::handler::HandlerError> {
+        async fn handle(
+            &self,
+            mut conn: rustun::ProxyConn,
+        ) -> Result<(), rustun::handler::HandlerError> {
             let mut buf = vec![0u8; 1024];
             let n = conn.read(&mut buf).await?;
             conn.write_all(&buf[..n]).await?;
@@ -663,4 +666,117 @@ async fn integration_server_handles_concurrent_connections() {
     }
 
     server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// TLS transport
+//
+// `-L http+tls://` terminates TLS and then runs the ordinary HTTP handler over
+// the decrypted stream. Before the connection type was decoupled from
+// TcpStream this could not work at all: the listener bound a plain TCP socket
+// and served unencrypted traffic while reporting success.
+// ---------------------------------------------------------------------------
+
+/// Builds a self-signed identity, or returns None when the platform's TLS
+/// backend cannot construct one from PEM (Windows schannel needs PKCS#12).
+fn self_signed_identity() -> Option<(native_tls::Identity, Vec<u8>)> {
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).ok()?;
+    let cert_pem = generated.cert.pem();
+    let key_pem = generated.key_pair.serialize_pem();
+    let identity =
+        native_tls::Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes()).ok()?;
+    Some((identity, cert_pem.into_bytes()))
+}
+
+#[tokio::test]
+async fn integration_tls_listener_terminates_tls_and_runs_the_handler() {
+    let Some((identity, _cert_pem)) = self_signed_identity() else {
+        eprintln!(
+            "skipping: this platform's TLS backend cannot build an identity from PEM \
+             (expected on Windows/schannel; the Linux build is unaffected)"
+        );
+        return;
+    };
+
+    let (target_addr, _target) = start_message_server(b"tls-tunnel-ok").await;
+
+    let handler = rustun::HttpHandler::new(rustun::HandlerOptions::default());
+    let server = rustun::TlsServer::new("127.0.0.1:0", identity, handler)
+        .await
+        .unwrap();
+    let proxy_addr = server.local_addr().unwrap();
+    let cancel = server.cancel_token();
+    tokio::spawn(async move {
+        server.serve().await.ok();
+    });
+
+    // A TLS client speaking HTTP CONNECT over the encrypted channel.
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .unwrap();
+    let connector = tokio_native_tls::TlsConnector::from(connector);
+
+    let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut tls = connector.connect("localhost", tcp).await.unwrap();
+
+    let req = format!(
+        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+        target_addr, target_addr
+    );
+    tls.write_all(req.as_bytes()).await.unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let n = tls.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("200"), "expected 200 over TLS, got: {}", resp);
+
+    let mut data = vec![0u8; 1024];
+    let n = tls.read(&mut data).await.unwrap();
+    assert_eq!(&data[..n], b"tls-tunnel-ok");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn integration_tls_listener_rejects_a_plaintext_client() {
+    let Some((identity, _)) = self_signed_identity() else {
+        eprintln!("skipping: platform TLS backend cannot build an identity from PEM");
+        return;
+    };
+
+    let handler = rustun::HttpHandler::new(rustun::HandlerOptions::default());
+    let server = rustun::TlsServer::new("127.0.0.1:0", identity, handler)
+        .await
+        .unwrap();
+    let proxy_addr = server.local_addr().unwrap();
+    let cancel = server.cancel_token();
+    tokio::spawn(async move {
+        server.serve().await.ok();
+    });
+
+    // Speaking cleartext to a TLS listener must not be served. This is the
+    // regression guard for the old behaviour, where the transport was ignored
+    // and a plaintext HTTP request would have been proxied happily.
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+        .await
+        .expect("TLS listener should not hang on a plaintext client")
+        .unwrap_or(0);
+
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        !resp.contains("200"),
+        "a plaintext client must not get a proxied tunnel, got: {:?}",
+        resp
+    );
+
+    cancel.cancel();
 }

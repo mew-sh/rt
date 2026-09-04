@@ -2,11 +2,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::chain::{Chain, ChainError, ChainOptions};
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::permissions::Can;
 use crate::transport::transport;
@@ -173,7 +174,7 @@ impl Socks4Handler {
     /// gost: socks4Handler.handleConnect (socks.go:1703-1797)
     async fn handle_connect(
         &self,
-        mut conn: TcpStream,
+        mut conn: ProxyConn,
         target: &str,
         peer_addr: &str,
     ) -> Result<(), HandlerError> {
@@ -222,7 +223,7 @@ impl Socks4Handler {
     /// line with the SOCKS4 two-reply BIND sequence.
     async fn handle_bind(
         &self,
-        mut conn: TcpStream,
+        mut conn: ProxyConn,
         target: &str,
         is_socks4a: bool,
         peer_addr: &str,
@@ -284,7 +285,7 @@ impl Socks4Handler {
 /// address, then on peer accept reply a second time with the peer's address
 /// before splicing. Analogous to gost's socks5 `bindOn` (socks.go:1020-1114).
 async fn socks4_bind_on(
-    mut conn: TcpStream,
+    mut conn: ProxyConn,
     addr: &str,
     peer_addr: &str,
 ) -> Result<(), HandlerError> {
@@ -355,11 +356,8 @@ async fn socks4_bind_on(
 
 #[async_trait]
 impl Handler for Socks4Handler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
 
         // Read version byte (already peeked by auto handler)
         let mut ver = [0u8; 1];
@@ -434,12 +432,17 @@ impl Handler for Socks4Handler {
     }
 }
 
-async fn send_reply(
-    conn: &mut TcpStream,
+/// Generic over the stream so the same reply writer serves a `ProxyConn`
+/// control connection and a plain `TcpStream`.
+async fn send_reply<S>(
+    conn: &mut S,
     code: u8,
     addr: &str,
     port: u16,
-) -> Result<(), HandlerError> {
+) -> Result<(), HandlerError>
+where
+    S: AsyncWrite + Unpin + Send + ?Sized,
+{
     let ip: Ipv4Addr = addr.parse().unwrap_or(Ipv4Addr::UNSPECIFIED);
     let mut reply = vec![0x00, code]; // VN=0, CD=code
     reply.extend_from_slice(&port.to_be_bytes());
@@ -481,7 +484,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Connect as SOCKS4 client
@@ -528,7 +531,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Connect as SOCKS4a client (with domain name as IP address)
@@ -562,7 +565,7 @@ mod tests {
         tokio::spawn(async move {
             let handler = Socks4Handler::new(options);
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
         addr
     }
@@ -825,7 +828,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Use Socks4Connector

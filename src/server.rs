@@ -18,6 +18,10 @@ pub struct Server {
     handler: Arc<dyn Handler>,
     cancel: CancellationToken,
     tracker: TaskTracker,
+    /// Whether to read SO_ORIGINAL_DST from each accepted socket. Only a
+    /// transparent-proxy listener needs it, and it has to happen here because
+    /// the raw socket is not reachable once the stream is boxed.
+    capture_original_dst: bool,
 }
 
 impl Server {
@@ -34,6 +38,7 @@ impl Server {
             handler: Arc::new(handler),
             cancel: CancellationToken::new(),
             tracker: TaskTracker::new(),
+            capture_original_dst: false,
         })
     }
 
@@ -44,7 +49,15 @@ impl Server {
             handler: Arc::new(handler),
             cancel: CancellationToken::new(),
             tracker: TaskTracker::new(),
+            capture_original_dst: false,
         }
+    }
+
+    /// Reads the pre-NAT destination from each accepted socket and attaches it
+    /// to the connection. Only meaningful for a transparent-proxy listener.
+    pub fn with_original_dst(mut self, enabled: bool) -> Self {
+        self.capture_original_dst = enabled;
+        self
     }
 
     /// Returns the local address the server is bound to.
@@ -77,11 +90,19 @@ impl Server {
                             temp_delay = Duration::ZERO;
                             let handler = self.handler.clone();
                             let cancel = self.cancel.clone();
+                            // Must be read here, while the raw socket still exists.
+                            let original_dst = if self.capture_original_dst {
+                                crate::redirect::original_dst(&stream)
+                            } else {
+                                None
+                            };
 
                             // Spawn through TaskTracker so we can wait for completion
                             self.tracker.spawn(async move {
+                                let conn = crate::conn::ProxyConn::from_tcp(stream)
+                                    .with_original_dst(original_dst);
                                 tokio::select! {
-                                    result = handler.handle(stream) => {
+                                    result = handler.handle(conn) => {
                                         if let Err(e) = result {
                                             tracing::debug!("[server] {} : {}", peer_addr, e);
                                         }
@@ -134,6 +155,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::ProxyConn;
     use crate::handler::{Handler, HandlerError};
     use async_trait::async_trait;
     use tokio::net::TcpStream;
@@ -142,7 +164,7 @@ mod tests {
 
     #[async_trait]
     impl Handler for EchoHandler {
-        async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
+        async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 1024];
             let n = conn.read(&mut buf).await?;

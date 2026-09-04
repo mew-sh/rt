@@ -2,11 +2,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
 use crate::chain::{Chain, ChainError, ChainOptions};
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::permissions::Can;
 use crate::transport::transport;
@@ -192,7 +193,7 @@ impl Socks5Handler {
     /// gost: socks5Handler.handleConnect (socks.go:880-978)
     async fn handle_connect(
         &self,
-        mut conn: TcpStream,
+        mut conn: ProxyConn,
         target: &str,
         peer_addr: &str,
     ) -> Result<(), HandlerError> {
@@ -238,7 +239,7 @@ impl Socks5Handler {
     /// gost: socks5Handler.handleBind (socks.go:981-1018)
     async fn handle_bind(
         &self,
-        mut conn: TcpStream,
+        mut conn: ProxyConn,
         target: &str,
         peer_addr: &str,
     ) -> Result<(), HandlerError> {
@@ -297,7 +298,7 @@ impl Socks5Handler {
     /// gost: socks5Handler.handleUDPRelay (socks.go:1116-1217)
     async fn handle_udp_relay(
         &self,
-        mut conn: TcpStream,
+        mut conn: ProxyConn,
         target: &str,
         peer_addr: &str,
     ) -> Result<(), HandlerError> {
@@ -314,6 +315,9 @@ impl Socks5Handler {
 
         // Bind the relay socket on the out-going interface's IP, exactly as
         // gost does (socks.go:1128) so the address we advertise is reachable.
+        // `ProxyConn` carries the accepted socket's local address through every
+        // transport layer, so this stays the listener's real interface IP even
+        // when the control connection is TLS/WebSocket rather than raw TCP.
         let local_ip = conn
             .local_addr()
             .map(|a| a.ip())
@@ -495,11 +499,8 @@ impl Socks5Handler {
 
 #[async_trait]
 impl Handler for Socks5Handler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
 
         // Read greeting
         let mut ver = [0u8; 1];
@@ -590,7 +591,7 @@ impl Handler for Socks5Handler {
 /// and on the first inbound peer connection sends a second reply carrying the
 /// peer's address before splicing the two connections together.
 async fn bind_on(
-    mut conn: TcpStream,
+    mut conn: ProxyConn,
     addr: &str,
     peer_addr: &str,
 ) -> Result<(), HandlerError> {
@@ -669,7 +670,13 @@ async fn bind_on(
 
 /// gost: socks5Handler.discardClientData (socks.go:1219-1233).
 /// Resolves when the control connection is closed by the client.
-async fn discard_client_data(conn: &mut TcpStream) -> std::io::Result<()> {
+///
+/// Generic over the stream: a `ProxyConn` read returns 0 on EOF exactly like a
+/// `TcpStream`, so the association still dies with the control connection.
+async fn discard_client_data<S>(conn: &mut S) -> std::io::Result<()>
+where
+    S: AsyncRead + Unpin + Send + ?Sized,
+{
     let mut buf = vec![0u8; crate::SMALL_BUFFER_SIZE];
     loop {
         let n = conn.read(&mut buf).await?;
@@ -682,10 +689,13 @@ async fn discard_client_data(conn: &mut TcpStream) -> std::io::Result<()> {
 
 /// Client-side SOCKS5 method negotiation, used when forwarding a BIND request
 /// through a chain node.
-async fn socks5_method_handshake(
-    conn: &mut TcpStream,
+async fn socks5_method_handshake<S>(
+    conn: &mut S,
     user: Option<&(String, Option<String>)>,
-) -> Result<(), HandlerError> {
+) -> Result<(), HandlerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+{
     let methods: Vec<u8> = if user.is_some() {
         vec![METHOD_NO_AUTH, METHOD_USER_PASS]
     } else {
@@ -793,12 +803,17 @@ async fn resolve_udp_addr(host: &str, port: u16) -> Option<SocketAddr> {
     tokio::net::lookup_host((host, port)).await.ok()?.next()
 }
 
-async fn send_reply(
-    conn: &mut TcpStream,
+/// Generic over the stream so the same reply writer serves a `ProxyConn`
+/// control connection and a plain `TcpStream`.
+async fn send_reply<S>(
+    conn: &mut S,
     rep: u8,
     addr: &str,
     port: u16,
-) -> Result<(), HandlerError> {
+) -> Result<(), HandlerError>
+where
+    S: AsyncWrite + Unpin + Send + ?Sized,
+{
     let mut reply = vec![SOCKS5_VERSION, rep, 0x00];
     if let Ok(ip) = addr.parse::<Ipv4Addr>() {
         reply.push(ATYP_IPV4);
@@ -857,7 +872,10 @@ fn encode_address(host: &str, port: u16, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&port.to_be_bytes());
 }
 
-async fn read_address(conn: &mut TcpStream, atyp: u8) -> Result<(String, u16), HandlerError> {
+async fn read_address<S>(conn: &mut S, atyp: u8) -> Result<(String, u16), HandlerError>
+where
+    S: AsyncRead + Unpin + Send + ?Sized,
+{
     let host = match atyp {
         ATYP_IPV4 => {
             let mut addr = [0u8; 4];
@@ -886,7 +904,10 @@ async fn read_address(conn: &mut TcpStream, atyp: u8) -> Result<(String, u16), H
     Ok((host, port))
 }
 
-async fn skip_address(conn: &mut TcpStream, atyp: u8) -> Result<(), HandlerError> {
+async fn skip_address<S>(conn: &mut S, atyp: u8) -> Result<(), HandlerError>
+where
+    S: AsyncRead + Unpin + Send + ?Sized,
+{
     match atyp {
         ATYP_IPV4 => {
             let mut buf = [0u8; 6]; // 4 + 2
@@ -930,7 +951,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         // Connect as SOCKS5 client
@@ -986,7 +1007,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1075,7 +1096,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1115,7 +1136,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1154,7 +1175,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1186,7 +1207,7 @@ mod tests {
         tokio::spawn(async move {
             let handler = Socks5Handler::new(options);
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
         addr
     }
@@ -1884,7 +1905,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(conn).await.ok();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
         });
 
         let connector = Socks5Connector::new(None);

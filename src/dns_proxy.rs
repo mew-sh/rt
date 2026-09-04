@@ -3,11 +3,12 @@
 //! gost splits this into a `dnsListener` (which speaks udp / tcp / tcp-tls /
 //! DoH and turns every message into a fake `net.Conn`) and a `dnsHandler`
 //! (which unpacks the message and calls `Resolver.Exchange`). This crate's
-//! `Handler` trait is fixed to a real `TcpStream`, so the split here is:
+//! `Handler` trait serves a single stream connection, so the split here is:
 //!
 //! * [`DnsHandler`] -- the `Handler` for stream transports (`mode=tcp`, and
-//!   `mode=tls` once the TCP stream has been wrapped). Length prefixed framing
-//!   per RFC 1035 4.2.2.
+//!   `mode=tls` once the stream has been wrapped). Length prefixed framing
+//!   per RFC 1035 4.2.2. `serve_stream` stays generic over the stream type so
+//!   the DoT path can reuse it on a `TlsStream`.
 //! * [`DnsServer`] -- owns the listener for all four `?mode=` values and calls
 //!   [`Resolver::exchange`] directly, which is what gost's handler does.
 //! * [`DnsUdpProxy`] -- the standalone UDP server (kept for API compatibility).
@@ -23,6 +24,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_native_tls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+use crate::conn::ProxyConn;
 use crate::handler::{Handler, HandlerError, HandlerOptions};
 use crate::resolver::{Message, Resolver, DEFAULT_UDP_SIZE};
 
@@ -146,11 +148,8 @@ impl DnsHandler {
 
 #[async_trait]
 impl Handler for DnsHandler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
-        let peer_addr = conn
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
         self.serve_stream(&mut conn, &peer_addr).await
     }
 }
@@ -570,7 +569,7 @@ pub async fn serve_tcp(
         let resolver = resolver.clone();
         tokio::spawn(async move {
             let handler = DnsHandler::with_resolver(resolver, HandlerOptions::default());
-            let fut = handler.handle(stream);
+            let fut = handler.handle(ProxyConn::from_tcp(stream));
             let res = if read_timeout > Duration::ZERO {
                 match tokio::time::timeout(read_timeout, fut).await {
                     Ok(r) => r,
