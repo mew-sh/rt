@@ -1,8 +1,16 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use chacha20poly1305::ChaCha20Poly1305;
+use hkdf::Hkdf;
+use rand::RngCore;
+use sha1::Sha1;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
@@ -66,6 +74,347 @@ pub fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
     key
 }
 
+// --- Shadowsocks AEAD framing -------------------------------------------
+//
+// Each direction is an independent stream:
+//   salt (key_size bytes, cleartext)
+//   then repeating: AEAD(u16 BE payload length) || AEAD(payload)
+// The session subkey is HKDF-SHA1(master_key, salt, "ss-subkey") and the
+// nonce is a 96-bit little-endian counter incremented after every AEAD
+// operation. The target address header travels as the first payload bytes,
+// i.e. inside the encrypted stream.
+
+const TAG_LEN: usize = 16;
+const MAX_PAYLOAD: usize = 0x3FFF;
+const LEN_BLOCK: usize = 2 + TAG_LEN;
+const SUBKEY_INFO: &[u8] = b"ss-subkey";
+
+#[derive(Clone)]
+enum Aead {
+    Aes128(Box<Aes128Gcm>),
+    Aes256(Box<Aes256Gcm>),
+    ChaCha(Box<ChaCha20Poly1305>),
+}
+
+impl Aead {
+    /// Derives the per-session subkey from the master key and salt.
+    fn from_salt(cipher: &SsCipher, key: &[u8], salt: &[u8]) -> io::Result<Self> {
+        let mut subkey = vec![0u8; cipher.key_size()];
+        Hkdf::<Sha1>::new(Some(salt), key)
+            .expand(SUBKEY_INFO, &mut subkey)
+            .map_err(|_| io::Error::other("shadowsocks subkey derivation failed"))?;
+
+        Ok(match cipher {
+            SsCipher::Aes128Gcm => Aead::Aes128(Box::new(
+                Aes128Gcm::new_from_slice(&subkey).map_err(io::Error::other)?,
+            )),
+            SsCipher::Aes256Gcm => Aead::Aes256(Box::new(
+                Aes256Gcm::new_from_slice(&subkey).map_err(io::Error::other)?,
+            )),
+            SsCipher::ChaCha20Poly1305 => Aead::ChaCha(Box::new(
+                ChaCha20Poly1305::new_from_slice(&subkey).map_err(io::Error::other)?,
+            )),
+            SsCipher::Plain => unreachable!("plain cipher never builds an AEAD"),
+        })
+    }
+
+    fn seal(&self, nonce: &[u8; 12], buf: &mut Vec<u8>) -> io::Result<()> {
+        let nonce = nonce.into();
+        let r = match self {
+            Aead::Aes128(c) => c.encrypt_in_place(nonce, b"", buf),
+            Aead::Aes256(c) => c.encrypt_in_place(nonce, b"", buf),
+            Aead::ChaCha(c) => c.encrypt_in_place(nonce, b"", buf),
+        };
+        r.map_err(|_| io::Error::other("shadowsocks encryption failed"))
+    }
+
+    fn open(&self, nonce: &[u8; 12], buf: &mut Vec<u8>) -> io::Result<()> {
+        let nonce = nonce.into();
+        let r = match self {
+            Aead::Aes128(c) => c.decrypt_in_place(nonce, b"", buf),
+            Aead::Aes256(c) => c.decrypt_in_place(nonce, b"", buf),
+            Aead::ChaCha(c) => c.decrypt_in_place(nonce, b"", buf),
+        };
+        // A tag mismatch means the peer used a different password or cipher,
+        // or the stream was tampered with. Either way the stream is dead.
+        r.map_err(|_| io::Error::other("shadowsocks authentication tag mismatch"))
+    }
+}
+
+/// Increments the 96-bit little-endian nonce counter in place.
+fn bump_nonce(nonce: &mut [u8; 12]) {
+    for byte in nonce.iter_mut() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
+            break;
+        }
+    }
+}
+
+enum ReadState {
+    Salt,
+    Length,
+    Payload(usize),
+    Eof,
+}
+
+/// Wraps a stream in the Shadowsocks AEAD framing.
+pub struct SsStream<S> {
+    inner: S,
+    cipher: SsCipher,
+    key: Vec<u8>,
+
+    read_state: ReadState,
+    read_cipher: Option<Aead>,
+    read_nonce: [u8; 12],
+    read_buf: Vec<u8>,
+    read_need: usize,
+    plain: Vec<u8>,
+    plain_pos: usize,
+
+    write_cipher: Option<Aead>,
+    write_nonce: [u8; 12],
+    out: Vec<u8>,
+    out_pos: usize,
+}
+
+impl<S> SsStream<S> {
+    pub fn new(inner: S, cipher: SsCipher, key: Vec<u8>) -> Self {
+        let salt_len = cipher.key_size();
+        Self {
+            inner,
+            cipher,
+            key,
+            read_state: ReadState::Salt,
+            read_cipher: None,
+            read_nonce: [0u8; 12],
+            read_buf: Vec::with_capacity(salt_len.max(LEN_BLOCK)),
+            read_need: salt_len,
+            plain: Vec::new(),
+            plain_pos: 0,
+            write_cipher: None,
+            write_nonce: [0u8; 12],
+            out: Vec::new(),
+            out_pos: 0,
+        }
+    }
+
+    fn is_plain(&self) -> bool {
+        matches!(self.cipher, SsCipher::Plain)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> SsStream<S> {
+    /// Reads until `read_buf` holds `read_need` bytes. `Ok(false)` means the
+    /// peer closed the stream.
+    fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        while self.read_buf.len() < self.read_need {
+            let start = self.read_buf.len();
+            self.read_buf.resize(self.read_need, 0);
+            let mut rb = ReadBuf::new(&mut self.read_buf[start..]);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
+                Poll::Pending => {
+                    self.read_buf.truncate(start);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => {
+                    self.read_buf.truncate(start);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    self.read_buf.truncate(start + n);
+                    if n == 0 {
+                        // A clean close on a block boundary is normal EOF;
+                        // mid-block it is a truncated stream.
+                        return Poll::Ready(Ok(false));
+                    }
+                }
+            }
+        }
+        Poll::Ready(Ok(true))
+    }
+
+    fn poll_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.out_pos < self.out.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.out[self.out_pos..]) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()))
+                }
+                Poll::Ready(Ok(n)) => self.out_pos += n,
+            }
+        }
+        self.out.clear();
+        self.out_pos = 0;
+        Poll::Ready(Ok(()))
+    }
+
+    /// Queues the salt and one encrypted chunk of `data` into `out`.
+    fn seal_chunk(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.write_cipher.is_none() {
+            let mut salt = vec![0u8; self.cipher.key_size()];
+            rand::thread_rng().fill_bytes(&mut salt);
+            self.write_cipher = Some(Aead::from_salt(&self.cipher, &self.key, &salt)?);
+            self.out.extend_from_slice(&salt);
+        }
+        let aead = self.write_cipher.as_ref().expect("cipher just set");
+
+        let mut len_block = (data.len() as u16).to_be_bytes().to_vec();
+        aead.seal(&self.write_nonce, &mut len_block)?;
+        bump_nonce(&mut self.write_nonce);
+        self.out.extend_from_slice(&len_block);
+
+        let mut payload = data.to_vec();
+        aead.seal(&self.write_nonce, &mut payload)?;
+        bump_nonce(&mut self.write_nonce);
+        self.out.extend_from_slice(&payload);
+
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SsStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        if me.is_plain() {
+            return Pin::new(&mut me.inner).poll_read(cx, buf);
+        }
+
+        loop {
+            // Drain anything already decrypted before pulling more.
+            if me.plain_pos < me.plain.len() {
+                let n = buf.remaining().min(me.plain.len() - me.plain_pos);
+                buf.put_slice(&me.plain[me.plain_pos..me.plain_pos + n]);
+                me.plain_pos += n;
+                if me.plain_pos == me.plain.len() {
+                    me.plain.clear();
+                    me.plain_pos = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            if matches!(me.read_state, ReadState::Eof) {
+                return Poll::Ready(Ok(()));
+            }
+
+            let complete = match me.poll_fill(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(c)) => c,
+            };
+            if !complete {
+                // EOF between blocks is orderly; part-way through one is not.
+                if me.read_buf.is_empty() {
+                    me.read_state = ReadState::Eof;
+                    return Poll::Ready(Ok(()));
+                }
+                return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+            }
+
+            match me.read_state {
+                ReadState::Salt => {
+                    let salt = std::mem::take(&mut me.read_buf);
+                    me.read_cipher = Some(Aead::from_salt(&me.cipher, &me.key, &salt)?);
+                    me.read_state = ReadState::Length;
+                    me.read_need = LEN_BLOCK;
+                }
+                ReadState::Length => {
+                    let mut block = std::mem::take(&mut me.read_buf);
+                    let aead = me
+                        .read_cipher
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("missing shadowsocks read cipher"))?;
+                    aead.open(&me.read_nonce, &mut block)?;
+                    bump_nonce(&mut me.read_nonce);
+
+                    let len = u16::from_be_bytes([block[0], block[1]]) as usize;
+                    if len == 0 || len > MAX_PAYLOAD {
+                        return Poll::Ready(Err(io::Error::other(format!(
+                            "invalid shadowsocks payload length: {}",
+                            len
+                        ))));
+                    }
+                    me.read_state = ReadState::Payload(len);
+                    me.read_need = len + TAG_LEN;
+                }
+                ReadState::Payload(_) => {
+                    let mut block = std::mem::take(&mut me.read_buf);
+                    let aead = me
+                        .read_cipher
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("missing shadowsocks read cipher"))?;
+                    aead.open(&me.read_nonce, &mut block)?;
+                    bump_nonce(&mut me.read_nonce);
+
+                    me.plain = block;
+                    me.plain_pos = 0;
+                    me.read_state = ReadState::Length;
+                    me.read_need = LEN_BLOCK;
+                }
+                ReadState::Eof => unreachable!("handled above"),
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        if me.is_plain() {
+            return Pin::new(&mut me.inner).poll_write(cx, buf);
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Bound memory by draining the previous chunk before sealing another.
+        if let Poll::Pending = me.poll_flush_out(cx) {
+            return Poll::Pending;
+        }
+
+        let n = buf.len().min(MAX_PAYLOAD);
+        me.seal_chunk(&buf[..n])?;
+
+        // Best-effort flush; whatever remains goes out on the next call.
+        let _ = me.poll_flush_out(cx);
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        if me.is_plain() {
+            return Pin::new(&mut me.inner).poll_flush(cx);
+        }
+        match me.poll_flush_out(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => Pin::new(&mut me.inner).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        if !me.is_plain() {
+            match me.poll_flush_out(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+        Pin::new(&mut me.inner).poll_shutdown(cx)
+    }
+}
+
 /// Shadowsocks connector (client side).
 pub struct ShadowConnector {
     cipher: SsCipher,
@@ -73,26 +422,30 @@ pub struct ShadowConnector {
 }
 
 impl ShadowConnector {
-    pub fn new(method: &str, password: &str) -> Self {
-        let cipher = SsCipher::from_name(method).unwrap_or(SsCipher::Plain);
+    /// Fails when the cipher name is unknown, rather than silently falling
+    /// back to plaintext under an encrypted-looking configuration.
+    pub fn new(method: &str, password: &str) -> Result<Self, HandlerError> {
+        let cipher = SsCipher::from_name(method)
+            .ok_or_else(|| HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method)))?;
         let key = evp_bytes_to_key(password.as_bytes(), cipher.key_size());
-        Self { cipher, key }
+        Ok(Self { cipher, key })
     }
 
     /// Connect via Shadowsocks protocol.
     pub async fn connect(
         &self,
-        mut conn: TcpStream,
+        conn: TcpStream,
         address: &str,
-    ) -> Result<TcpStream, HandlerError> {
-        // Encode target address in SOCKS5-style format
+    ) -> Result<SsStream<TcpStream>, HandlerError> {
+        let mut stream = SsStream::new(conn, self.cipher.clone(), self.key.clone());
+
+        // The address header is the first payload inside the encrypted stream,
+        // so it goes through the wrapper rather than to the raw socket.
         let addr_buf = encode_ss_address(address)?;
+        stream.write_all(&addr_buf).await?;
+        stream.flush().await?;
 
-        // In a full implementation, we'd encrypt with AEAD
-        // For the plain cipher, just send the raw address header
-        conn.write_all(&addr_buf).await?;
-
-        Ok(conn)
+        Ok(stream)
     }
 }
 
@@ -118,42 +471,83 @@ pub struct ShadowHandler {
 }
 
 impl ShadowHandler {
-    pub fn new(method: &str, password: &str, options: HandlerOptions) -> Self {
-        let cipher = SsCipher::from_name(method).unwrap_or(SsCipher::Plain);
+    /// Fails when the cipher name is unknown, rather than silently falling
+    /// back to plaintext under an encrypted-looking configuration.
+    pub fn new(
+        method: &str,
+        password: &str,
+        options: HandlerOptions,
+    ) -> Result<Self, HandlerError> {
+        let cipher = SsCipher::from_name(method)
+            .ok_or_else(|| HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method)))?;
         let key = evp_bytes_to_key(password.as_bytes(), cipher.key_size());
-        Self {
+        Ok(Self {
             cipher,
             key,
             options,
-        }
+        })
     }
 }
 
 #[async_trait]
 impl Handler for ShadowHandler {
-    async fn handle(&self, mut conn: TcpStream) -> Result<(), HandlerError> {
+    async fn handle(&self, conn: TcpStream) -> Result<(), HandlerError> {
         let peer_addr = conn
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
-        // In a full implementation, we'd decrypt the AEAD stream
-        // Read the target address (SOCKS5-style)
-        let target = read_ss_address(&mut conn).await?;
+        let mut stream = SsStream::new(conn, self.cipher.clone(), self.key.clone());
+
+        // Decrypted by the wrapper; the header is the first payload chunk.
+        let target = read_ss_address(&mut stream).await?;
 
         info!("[ss] {} -> {}", peer_addr, target);
+
+        // gost applies the same access control here as the other handlers
+        // (ss.go:145-155); without it, whitelist/blacklist/bypass configured on
+        // an ss:// listener would be silently ignored.
+        if !crate::permissions::Can(
+            "tcp",
+            &target,
+            self.options.whitelist.as_ref(),
+            self.options.blacklist.as_ref(),
+        ) {
+            debug!("[ss] {} -> {} : blocked by permissions", peer_addr, target);
+            return Err(HandlerError::Forbidden);
+        }
+        if let Some(bypass) = self.options.bypass.as_ref() {
+            if bypass.contains(&target) {
+                debug!("[ss] {} -> {} : bypassed", peer_addr, target);
+                return Err(HandlerError::Forbidden);
+            }
+        }
 
         let chain = self.options.chain.as_ref().cloned().unwrap_or_default();
 
         match chain.dial(&target).await {
             Ok(cc) => {
                 info!("[ss] {} <-> {}", peer_addr, target);
-                transport(conn, cc).await.ok();
+                transport(stream, cc).await.ok();
                 info!("[ss] {} >-< {}", peer_addr, target);
                 Ok(())
             }
             Err(e) => Err(HandlerError::Chain(e)),
         }
+    }
+}
+
+/// Splits `host:port`, tolerating bracketed IPv6 literals and a missing port.
+fn split_host_port_str(addr: &str) -> (&str, u16) {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((host, rest)) = rest.split_once(']') {
+            let port = rest.strip_prefix(':').and_then(|p| p.parse().ok());
+            return (host, port.unwrap_or(0));
+        }
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().unwrap_or(0)),
+        None => (addr, 0),
     }
 }
 
@@ -203,7 +597,7 @@ fn encode_ss_address(address: &str) -> Result<Vec<u8>, HandlerError> {
 }
 
 /// Read target address in Shadowsocks format.
-async fn read_ss_address(conn: &mut TcpStream) -> Result<String, HandlerError> {
+async fn read_ss_address<R: AsyncRead + Unpin>(conn: &mut R) -> Result<String, HandlerError> {
     let mut atyp = [0u8; 1];
     conn.read_exact(&mut atyp).await?;
 
@@ -308,7 +702,8 @@ mod tests {
         });
 
         // Start SS handler (plain cipher for testing)
-        let handler = ShadowHandler::new("plain", "testpass", HandlerOptions::default());
+        let handler =
+            ShadowHandler::new("plain", "testpass", HandlerOptions::default()).unwrap();
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
 
@@ -339,12 +734,108 @@ mod tests {
             conn.write_all(b"connector ok").await.unwrap();
         });
 
-        let connector = ShadowConnector::new("plain", "testpass");
+        let connector = ShadowConnector::new("plain", "testpass").unwrap();
         let stream = TcpStream::connect(target_addr).await.unwrap();
         let mut conn = connector.connect(stream, "127.0.0.1:9999").await.unwrap();
 
         let mut buf = vec![0u8; 1024];
         let n = conn.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"connector ok");
+    }
+
+    #[test]
+    fn test_unknown_cipher_is_rejected_not_downgraded_to_plaintext() {
+        assert!(SsCipher::from_name("aes-256-cfb").is_none());
+        assert!(ShadowConnector::new("aes-256-cfb", "pw").is_err());
+        assert!(ShadowHandler::new("totally-bogus", "pw", HandlerOptions::default()).is_err());
+    }
+
+    /// Round-trips a payload through two `SsStream`s over a duplex pair and
+    /// asserts the bytes on the wire are not the plaintext.
+    async fn aead_roundtrip(method: &str, payload: &[u8]) {
+        let cipher = SsCipher::from_name(method).unwrap();
+        let key = evp_bytes_to_key(b"correct horse", cipher.key_size());
+
+        let (client_raw, server_raw) = tokio::io::duplex(1 << 20);
+        let mut client = SsStream::new(client_raw, cipher.clone(), key.clone());
+        let mut server = SsStream::new(server_raw, cipher, key);
+
+        let expected = payload.to_vec();
+        let writer = tokio::spawn(async move {
+            client.write_all(&expected).await.unwrap();
+            client.flush().await.unwrap();
+            client
+        });
+
+        let mut got = vec![0u8; payload.len()];
+        server.read_exact(&mut got).await.unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(got, payload, "{} round-trip mismatch", method);
+    }
+
+    #[tokio::test]
+    async fn test_aead_roundtrip_all_ciphers() {
+        for method in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
+            aead_roundtrip(method, b"the quick brown fox").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aead_roundtrip_spans_multiple_chunks() {
+        // Larger than MAX_PAYLOAD, so the writer must split it into several
+        // AEAD chunks and the reader must reassemble them.
+        let payload: Vec<u8> = (0..(MAX_PAYLOAD * 3 + 1)).map(|i| (i % 251) as u8).collect();
+        aead_roundtrip("aes-256-gcm", &payload).await;
+    }
+
+    #[tokio::test]
+    async fn test_ciphertext_on_the_wire_is_not_plaintext() {
+        let cipher = SsCipher::from_name("aes-256-gcm").unwrap();
+        let key = evp_bytes_to_key(b"pw", cipher.key_size());
+
+        let (client_raw, mut wire) = tokio::io::duplex(1 << 16);
+        let mut client = SsStream::new(client_raw, cipher.clone(), key);
+
+        let secret = b"SECRET-MARKER-DO-NOT-LEAK";
+        client.write_all(secret).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut raw = vec![0u8; cipher.key_size() + LEN_BLOCK + secret.len() + TAG_LEN];
+        wire.read_exact(&mut raw).await.unwrap();
+
+        assert!(
+            !raw.windows(secret.len()).any(|w| w == secret),
+            "plaintext marker found on the wire: the cipher is not on the data path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wrong_password_fails_authentication() {
+        let cipher = SsCipher::from_name("aes-256-gcm").unwrap();
+        let (client_raw, server_raw) = tokio::io::duplex(1 << 16);
+        let mut client = SsStream::new(
+            client_raw,
+            cipher.clone(),
+            evp_bytes_to_key(b"right", cipher.key_size()),
+        );
+        let mut server = SsStream::new(
+            server_raw,
+            cipher.clone(),
+            evp_bytes_to_key(b"wrong", cipher.key_size()),
+        );
+
+        tokio::spawn(async move {
+            client.write_all(b"hello").await.ok();
+            client.flush().await.ok();
+            // Keep the stream open so the reader sees a tag failure, not EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let mut buf = [0u8; 5];
+        assert!(
+            server.read_exact(&mut buf).await.is_err(),
+            "a mismatched password must fail the AEAD tag check"
+        );
     }
 }
