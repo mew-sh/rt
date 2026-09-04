@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+
+use tokio::net::TcpStream;
 use tracing::{debug, info};
 
 use crate::conn::ProxyConn;
@@ -197,32 +199,59 @@ impl Handler for UdpDirectForwardHandler {
             &node.addr
         };
 
-        let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        udp_socket.connect(target).await?;
+        // Route through the chain rather than opening a socket straight to the
+        // target. A configured `-F` was previously ignored here, so `-L udp://`
+        // sent its datagrams direct while every other listener honoured the
+        // chain.
+        let (host, port) = crate::permissions::split_host_port(target)
+            .map_err(|e| HandlerError::Proxy(format!("udp forward target {target}: {e}")))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| HandlerError::Proxy(format!("udp forward target {target}: bad port")))?;
+        let host = host.to_string();
+        let chain = self.options.chain.as_ref().cloned().unwrap_or_default();
+        let channel = chain
+            .dial_udp("0.0.0.0:0".parse().expect("valid bind address"))
+            .await
+            .map_err(HandlerError::Chain)?;
 
-        // Simple UDP relay: read from TCP, send as UDP, and vice versa
+        // gost expires an idle association rather than holding the relay open
+        // for the life of the process.
+        let idle = if self.options.timeout.is_zero() {
+            Duration::from_secs(60)
+        } else {
+            self.options.timeout
+        };
+
         let mut tcp_buf = vec![0u8; 65535];
-        let mut udp_buf = vec![0u8; 65535];
         loop {
             tokio::select! {
-                result = conn.read(&mut tcp_buf) => {
+                result = tokio::time::timeout(idle, conn.read(&mut tcp_buf)) => {
                     match result {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            udp_socket.send(&tcp_buf[..n]).await?;
+                        Err(_) => {
+                            debug!("[udp] {} - idle for {:?}, closing", peer_addr, idle);
+                            break;
                         }
-                        Err(e) => {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            channel.send_to(&tcp_buf[..n], &host, port).await?;
+                        }
+                        Ok(Err(e)) => {
                             debug!("[udp] read error: {}", e);
                             break;
                         }
                     }
                 }
-                result = udp_socket.recv(&mut udp_buf) => {
+                result = tokio::time::timeout(idle, channel.recv_from()) => {
                     match result {
-                        Ok(n) => {
-                            conn.write_all(&udp_buf[..n]).await?;
+                        Err(_) => {
+                            debug!("[udp] {} - idle for {:?}, closing", peer_addr, idle);
+                            break;
                         }
-                        Err(e) => {
+                        Ok(Ok((data, _, _))) => {
+                            conn.write_all(&data).await?;
+                        }
+                        Ok(Err(e)) => {
                             debug!("[udp] recv error: {}", e);
                             break;
                         }
