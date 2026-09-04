@@ -193,7 +193,7 @@ pub fn decode_name(buf: &[u8], start: usize) -> io::Result<(String, usize)> {
                 if pos + 2 > buf.len() {
                     return Err(wire_err("truncated compression pointer"));
                 }
-                let ptr = (((len & 0x3F) as usize) << 8) | buf[pos + 1] as usize;
+                let ptr = ((len & 0x3F) << 8) | buf[pos + 1] as usize;
                 if !jumped {
                     end_pos = pos + 2;
                     jumped = true;
@@ -609,7 +609,7 @@ pub fn ensure_port(addr: &str, default_port: &str) -> String {
 }
 
 fn io_other<E: fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 /// Dials TCP, going through the proxy chain when one is supplied.

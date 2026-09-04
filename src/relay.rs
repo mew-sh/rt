@@ -571,11 +571,9 @@ impl Handler for RelayHandler {
                         }
                     }
                 }
-                FEATURE_ADDR => {
-                    if !fdata.is_empty() {
-                        let (host, port) = parse_relay_addr(fdata);
-                        raddr = format!("{}:{}", host, port);
-                    }
+                FEATURE_ADDR if !fdata.is_empty() => {
+                    let (host, port) = parse_relay_addr(fdata);
+                    raddr = format!("{}:{}", host, port);
                 }
                 _ => {}
             }

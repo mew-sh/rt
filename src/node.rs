@@ -180,12 +180,7 @@ impl fmt::Display for Node {
             }
             return write!(f, "auto+{}://{}", self.transport, self.addr);
         }
-        if self.transport.is_empty() {
-            write!(f, "{}://{}", self.protocol, self.addr)
-        } else if self.protocol == self.transport
-            || self.transport == "tcp"
-            || self.transport.is_empty()
-        {
+        if self.protocol == self.transport || self.transport == "tcp" || self.transport.is_empty() {
             write!(f, "{}://{}", self.protocol, self.addr)
         } else {
             write!(f, "{}+{}://{}", self.protocol, self.transport, self.addr)

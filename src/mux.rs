@@ -676,8 +676,7 @@ impl SessionShared {
     /// ids always even, which is how the two ends avoid colliding.
     fn next_id(&self) -> io::Result<u32> {
         if self.go_away.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "smux: stream id overflow, no more streams",
             ));
         }
@@ -687,8 +686,7 @@ impl SessionShared {
         // `sid == sid % 2` is only true for 0 and 1, i.e. the counter wrapped.
         if sid == sid % 2 {
             self.go_away.store(true, Ordering::Release);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "smux: stream id overflow, no more streams",
             ));
         }

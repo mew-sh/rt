@@ -232,7 +232,7 @@ pub fn split_line_ref(line: &str) -> Vec<&str> {
     } else {
         line
     };
-    line.split(|c: char| c == ' ' || c == '\t')
+    line.split([' ', '\t'])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect()

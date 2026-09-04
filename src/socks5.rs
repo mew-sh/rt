@@ -195,6 +195,10 @@ impl<S> Socks5UdpTunnelConn<S> {
     }
 }
 
+/// One received datagram with its source address, or `None` at end of
+/// stream. Named because the nested type is otherwise unreadable.
+type PollDatagram = Poll<io::Result<Option<(Vec<u8>, String, u16)>>>;
+
 impl<S: AsyncRead + Unpin> Socks5UdpTunnelConn<S> {
     /// Reads until `read_buf` holds `read_need` bytes. `Ok(false)` means the
     /// peer closed the stream before that many arrived.
@@ -309,10 +313,7 @@ impl<S: AsyncRead + Unpin> Socks5UdpTunnelConn<S> {
         }
     }
 
-    fn poll_recv_from(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<Option<(Vec<u8>, String, u16)>>> {
+    fn poll_recv_from(&mut self, cx: &mut Context<'_>) -> PollDatagram {
         match self.poll_datagram(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),

@@ -321,7 +321,7 @@ impl KcpConfig {
     /// [`KcpConfig::validate`].
     pub fn from_node(node: &Node) -> Result<Self, BoxError> {
         let mut config = match node.get("c") {
-            Some(path) if !path.is_empty() => KcpConfig::load(&path)
+            Some(path) if !path.is_empty() => KcpConfig::load(path)
                 .map_err(|e| -> BoxError { format!("kcp: reading {}: {}", path, e).into() })?,
             _ => {
                 let mut config = KcpConfig::default();
@@ -472,7 +472,7 @@ fn crc32_ieee(data: &[u8]) -> u32 {
 /// mistaken for a stream of the data it covers.
 fn crc32c_masked(data: &[u8]) -> u32 {
     let c = crc32(&CRC32_CASTAGNOLI, data);
-    ((c >> 15) | (c << 17)).wrapping_add(0xa282_ead8)
+    c.rotate_right(15).wrapping_add(0xa282_ead8)
 }
 
 // ---------------------------------------------------------------------------

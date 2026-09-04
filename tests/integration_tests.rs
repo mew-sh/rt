@@ -858,8 +858,10 @@ async fn integration_chain_through_a_websocket_proxy() {
 async fn integration_chain_ws_hop_respects_a_custom_path() {
     // gost serves only the configured path and 404s anything else, so a
     // mismatched `?path=` must fail the handshake rather than connect anyway.
-    let mut opts = rt::WsOptions::default();
-    opts.path = "/tunnel".to_string();
+    let opts = rt::WsOptions {
+        path: "/tunnel".to_string(),
+        ..Default::default()
+    };
 
     let proxy = rt::WsServer::new(
         "127.0.0.1:0",

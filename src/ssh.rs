@@ -473,14 +473,14 @@ impl SshForwardHandler {
                 warn!(
                     "[ssh-forward] no ?ssh_key= given; generated an ephemeral host key \
                      {} — it changes on every restart, so clients cannot pin it",
-                    fingerprint(&key.public_key())
+                    fingerprint(key.public_key())
                 );
                 key
             }
         };
         info!(
             "[ssh-forward] host key fingerprint {}",
-            fingerprint(&host_key.public_key())
+            fingerprint(host_key.public_key())
         );
 
         // Offer exactly the methods that can succeed. Advertising `none` would
@@ -1428,8 +1428,8 @@ mod tests {
         let (path, key) = temp_key_file("roundtrip");
         let loaded = parse_ssh_key_file(&path, None).unwrap();
         assert_eq!(
-            fingerprint(&loaded.public_key()),
-            fingerprint(&key.public_key())
+            fingerprint(loaded.public_key()),
+            fingerprint(key.public_key())
         );
         std::fs::remove_file(&path).ok();
     }
@@ -1447,8 +1447,8 @@ mod tests {
 
         let keys = AuthorizedKeys::parse(&format!("# comment\n\n{}\n", line)).unwrap();
         assert_eq!(keys.len(), 1);
-        assert!(keys.contains(&key.public_key()));
-        assert!(!keys.contains(&other.public_key()));
+        assert!(keys.contains(key.public_key()));
+        assert!(!keys.contains(other.public_key()));
     }
 
     #[test]
@@ -1462,7 +1462,7 @@ mod tests {
     fn test_generated_host_key_is_ed25519_and_unique() {
         let a = generate_host_key().unwrap();
         let b = generate_host_key().unwrap();
-        assert_ne!(fingerprint(&a.public_key()), fingerprint(&b.public_key()));
+        assert_ne!(fingerprint(a.public_key()), fingerprint(b.public_key()));
     }
 
     #[test]

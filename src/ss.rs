@@ -377,7 +377,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsStream<S> {
         }
 
         // Bound memory by draining the previous chunk before sealing another.
-        if let Poll::Pending = me.poll_flush_out(cx) {
+        if me.poll_flush_out(cx).is_pending() {
             return Poll::Pending;
         }
 

@@ -1065,7 +1065,7 @@ mod tests {
     impl Handler for AddrHandler {
         async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
             let mut buf = vec![0u8; 64];
-            conn.read(&mut buf).await?;
+            let _n = conn.read(&mut buf).await?;
             let reply = format!("{}|{}", conn.peer_addr_str(), conn.local_addr_str());
             conn.write_all(reply.as_bytes()).await?;
             Ok(())

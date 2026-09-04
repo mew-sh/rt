@@ -431,8 +431,8 @@ impl AsyncUdpSocket for CipherSocket {
             if n == 0 {
                 return Poll::Ready(Ok(0));
             }
-            drop(raw_bufs);
-
+            // `raw_bufs` borrowed `scratch` mutably; that borrow ends at
+            // the poll_recv above, so `scratch` can be read from here.
             let received = raw_meta[0];
             let plain = match self.cipher.open(&scratch[..received.len]) {
                 Ok(plain) => plain,
