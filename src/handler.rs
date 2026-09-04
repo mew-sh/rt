@@ -48,6 +48,9 @@ pub struct HandlerOptions {
     pub strategy: String,
     pub max_fails: u32,
     pub fail_timeout: Duration,
+    /// `?fastest_count=`: keep only the N lowest-latency targets. Zero
+    /// disables the filter, as in gost.
+    pub fastest_count: usize,
 }
 
 impl HandlerOptions {

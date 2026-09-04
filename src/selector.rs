@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::node::Node;
@@ -79,13 +81,29 @@ impl FilterSelector {
         max_fails: u32,
         fail_timeout: Duration,
     ) -> Self {
-        Self::new(
-            vec![
-                Box::new(InvalidFilter),
-                Box::new(FailFilter::new(max_fails, fail_timeout)),
-            ],
-            new_strategy(strategy),
-        )
+        Self::with_filters(strategy, max_fails, fail_timeout, 0)
+    }
+
+    /// As above, plus gost's fastest filter when `fastest_count` is non-zero
+    /// (route.go:64-72). A zero count leaves the filter out entirely, which is
+    /// what gost's "disabled" behaviour amounts to.
+    pub fn with_filters(
+        strategy: &str,
+        max_fails: u32,
+        fail_timeout: Duration,
+        fastest_count: usize,
+    ) -> Self {
+        let mut filters: Vec<Box<dyn Filter>> = vec![
+            Box::new(InvalidFilter),
+            Box::new(FailFilter::new(max_fails, fail_timeout)),
+        ];
+        if fastest_count > 0 {
+            filters.push(Box::new(FastestFilter::new(
+                DEFAULT_PING_TIMEOUT,
+                fastest_count,
+            )));
+        }
+        Self::new(filters, new_strategy(strategy))
     }
 }
 
@@ -251,6 +269,155 @@ impl Filter for FailFilter {
 
     fn name(&self) -> &str {
         "fail"
+    }
+}
+
+/// Default TCP ping timeout, matching gost's `NewFastestFilter` (selector.go:222-224).
+pub const DEFAULT_PING_TIMEOUT: Duration = Duration::from_millis(3000);
+
+#[derive(Debug, Clone, Copy)]
+struct PingEntry {
+    latency_ms: u64,
+    /// Unix seconds after which this measurement is stale.
+    expires_at: i64,
+}
+
+/// FastestFilter keeps the `top_count` lowest-latency nodes.
+///
+/// Latency is measured by timing a TCP connect, cached, and refreshed in the
+/// background — a filter cannot await, and blocking selection on a probe would
+/// add the probe's latency to every request. This mirrors gost
+/// (selector.go:212-297), including its randomised cache TTL, which stops all
+/// nodes expiring on the same tick.
+#[derive(Debug)]
+pub struct FastestFilter {
+    top_count: usize,
+    ping_timeout: Duration,
+    results: Arc<Mutex<HashMap<usize, PingEntry>>>,
+}
+
+impl FastestFilter {
+    pub fn new(ping_timeout: Duration, top_count: usize) -> Self {
+        Self {
+            top_count,
+            ping_timeout: if ping_timeout.is_zero() {
+                DEFAULT_PING_TIMEOUT
+            } else {
+                ping_timeout
+            },
+            results: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+
+    /// Returns the cached latency, kicking off a refresh when it is stale.
+    ///
+    /// An unmeasured node reports zero, so it sorts first and gets tried —
+    /// the same behaviour as gost, where the map returns the zero value.
+    fn latency_of(&self, node: &Node) -> u64 {
+        let now = Self::now_secs();
+        let mut results = self.results.lock().unwrap();
+        let entry = results.get(&node.id).copied();
+
+        let stale = entry.map(|e| e.expires_at < now).unwrap_or(true);
+        if stale {
+            // Hold off other refreshes for a few seconds so a slow probe is
+            // not started once per selection (gost uses the same guard).
+            results.insert(
+                node.id,
+                PingEntry {
+                    latency_ms: entry.map(|e| e.latency_ms).unwrap_or(0),
+                    expires_at: now + 5,
+                },
+            );
+            self.spawn_probe(node.id, node.addr.clone());
+        }
+
+        entry.map(|e| e.latency_ms).unwrap_or(0)
+    }
+
+    fn spawn_probe(&self, id: usize, addr: String) {
+        // Only measure when a runtime is available; `filter` is sync and may be
+        // called from a plain test.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let results = self.results.clone();
+        let timeout = self.ping_timeout;
+
+        handle.spawn(async move {
+            let started = tokio::time::Instant::now();
+            let reachable = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr))
+                .await
+                .is_ok_and(|r| r.is_ok());
+
+            // An unreachable node is recorded at the timeout, so it sorts last
+            // rather than looking instantaneous.
+            let latency_ms = if reachable {
+                started.elapsed().as_millis() as u64
+            } else {
+                timeout.as_millis() as u64
+            };
+
+            // Randomised TTL between 180 and 300 seconds, as in gost.
+            let ttl = 300 - (120.0 * rand::random::<f64>()) as i64;
+            let expires_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+                + ttl;
+
+            results.lock().unwrap().insert(
+                id,
+                PingEntry {
+                    latency_ms,
+                    expires_at,
+                },
+            );
+        });
+    }
+
+    /// Records a latency directly. Used by tests to avoid depending on real
+    /// network timing.
+    pub fn set_latency(&self, node_id: usize, latency_ms: u64) {
+        self.results.lock().unwrap().insert(
+            node_id,
+            PingEntry {
+                latency_ms,
+                expires_at: Self::now_secs() + 300,
+            },
+        );
+    }
+}
+
+impl Filter for FastestFilter {
+    fn filter(&self, nodes: &[Node]) -> Vec<Node> {
+        // gost treats a zero count as "disabled" rather than "keep nothing".
+        if self.top_count == 0 {
+            return nodes.to_vec();
+        }
+
+        let mut scored: Vec<(u64, Node)> = nodes
+            .iter()
+            .map(|n| (self.latency_of(n), n.clone()))
+            .collect();
+        scored.sort_by_key(|(latency, _)| *latency);
+
+        scored
+            .into_iter()
+            .take(self.top_count)
+            .map(|(_, n)| n)
+            .collect()
+    }
+
+    fn name(&self) -> &str {
+        "fastest"
     }
 }
 
@@ -449,6 +616,59 @@ mod tests {
         nodes[1].mark_dead();
         let sel = FilterSelector::with_fail_filter("round", 1, Duration::from_secs(30));
         assert!(sel.select(&nodes).is_err());
+    }
+
+    #[test]
+    fn test_fastest_filter_keeps_the_lowest_latency_nodes() {
+        let nodes = make_nodes(&["slow:1", "fast:2", "medium:3"]);
+        let f = FastestFilter::new(Duration::from_millis(100), 2);
+        // Seed the cache so the test does not depend on real network timing.
+        f.set_latency(nodes[0].id, 300);
+        f.set_latency(nodes[1].id, 10);
+        f.set_latency(nodes[2].id, 100);
+
+        let kept: Vec<String> = f.filter(&nodes).into_iter().map(|n| n.addr).collect();
+        assert_eq!(kept, vec!["fast:2".to_string(), "medium:3".to_string()]);
+    }
+
+    #[test]
+    fn test_fastest_filter_zero_count_is_disabled_not_empty() {
+        // gost treats topCount == 0 as "filter off", not "discard everything".
+        let nodes = make_nodes(&["a:1", "b:2"]);
+        let f = FastestFilter::new(Duration::from_millis(100), 0);
+        assert_eq!(f.filter(&nodes).len(), 2);
+    }
+
+    #[test]
+    fn test_fastest_filter_keeps_all_when_fewer_than_top_count() {
+        let nodes = make_nodes(&["a:1", "b:2"]);
+        let f = FastestFilter::new(Duration::from_millis(100), 5);
+        assert_eq!(f.filter(&nodes).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_fastest_filter_measures_a_real_node() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let nodes = make_nodes(&[&addr.to_string(), "127.0.0.1:1"]);
+        let f = FastestFilter::new(Duration::from_millis(200), 1);
+
+        // First pass has no measurements yet and only schedules the probes.
+        let _ = f.filter(&nodes);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // The reachable node must now win over the refused one, which is
+        // recorded at the timeout rather than as instantaneous.
+        let kept = f.filter(&nodes);
+        assert_eq!(kept[0].addr, addr.to_string());
     }
 
     #[test]

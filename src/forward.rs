@@ -42,10 +42,11 @@ impl TcpDirectForwardHandler {
         // Without this, `mark_dead` records a failure that selection ignores,
         // so a dead target keeps being handed back on every request.
         group.set_selector(std::sync::Arc::new(
-            crate::selector::FilterSelector::with_fail_filter(
+            crate::selector::FilterSelector::with_filters(
                 &options.strategy,
                 options.max_fails,
                 options.fail_timeout,
+                options.fastest_count,
             ),
         ));
 
@@ -156,10 +157,11 @@ impl UdpDirectForwardHandler {
         // Without this, `mark_dead` records a failure that selection ignores,
         // so a dead target keeps being handed back on every request.
         group.set_selector(std::sync::Arc::new(
-            crate::selector::FilterSelector::with_fail_filter(
+            crate::selector::FilterSelector::with_filters(
                 &options.strategy,
                 options.max_fails,
                 options.fail_timeout,
+                options.fastest_count,
             ),
         ));
 

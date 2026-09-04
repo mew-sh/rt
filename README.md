@@ -1428,7 +1428,7 @@ making them cross-implementation rather than self-consistent.
 | Transparent proxy (UDP) | Absent | Needs tproxy |
 | Authentication | Working | Inline credentials and secrets file, with live reload |
 | Bypass / permissions | Working | go-glob semantics for permissions, IPv6-correct, fails closed |
-| Load balancing | Working | round/random/fifo with FailFilter and InvalidFilter. FastestFilter absent |
+| Load balancing | Working | round/random/fifo with FailFilter, InvalidFilter and FastestFilter (`?fastest_count=`) |
 | Live reload | Working | Driven for secrets, bypass, hosts and dns |
 | Configuration file | Working | gost v2 JSON format |
 | TLS transport (listener) | Working | `-L xxx+tls://` terminates TLS via rustls and runs the handler over it; `?cert=`/`?key=` or a generated self-signed cert |

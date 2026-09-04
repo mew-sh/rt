@@ -305,6 +305,7 @@ fn build_handler_options(node: &Node, mut chain: Chain) -> HandlerOptions {
         strategy: node.get("strategy").unwrap_or("round").to_string(),
         max_fails: node.get_int("max_fails").max(0) as u32,
         fail_timeout: node.get_duration("fail_timeout"),
+        fastest_count: node.get_int("fastest_count").max(0) as usize,
     }
 }
 
