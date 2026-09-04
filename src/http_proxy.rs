@@ -899,6 +899,47 @@ Host: {}
     }
 
     #[tokio::test]
+    async fn test_probe_resist_web_relays_a_decoy_page() {
+        // A minimal origin server standing in for the decoy site.
+        let site = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let site_addr = site.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut c, _) = site.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = c.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(req.starts_with("GET /"), "decoy fetch should be a GET: {:?}", req);
+            c.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n<h1>decoy</h1>",
+            )
+            .await
+            .unwrap();
+        });
+
+        let spec = format!("web:{}", site_addr);
+        let resp = probe(auth_opts(&spec, ""), "example.com:443").await;
+
+        assert!(resp.contains("<h1>decoy</h1>"), "got: {:?}", resp);
+        assert!(!resp.contains("Proxy-Authenticate"));
+        assert!(!resp.contains("407"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_resist_web_rejects_an_https_decoy() {
+        // Relaying an https:// decoy would need a TLS client on this path.
+        // It must be an explicit failure, not a wrong-looking success.
+        assert!(fetch_decoy("https://example.com").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_probe_resist_unreachable_web_falls_back_to_503() {
+        // 127.0.0.1:1 is closed, so the fetch fails.
+        let resp = probe(auth_opts("web:127.0.0.1:1", ""), "example.com:443").await;
+        assert!(resp.starts_with("HTTP/1.1 503"), "got: {:?}", resp);
+        assert!(!resp.contains("Proxy-Authenticate"));
+    }
+
+    #[tokio::test]
     async fn test_probe_resist_host_forwards_to_a_decoy_server() {
         let decoy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let decoy_addr = decoy.local_addr().unwrap();
