@@ -1405,7 +1405,9 @@ and the release workflow, so that is where the cost belongs.
 Compatibility with gost is verified by running rustun against the real gost
 2.12.0 binary, in both directions for each scheme: rustun as the client dialing
 a gost listener, and gost as the client dialing a rustun listener. `interop.sh`
-drives it; it needs a `gost` binary and `curl`.
+drives the transport and protocol matrix; `interop-adv.sh` covers chain
+authentication, a rejected password, and multi-hop chains including a
+transport on a middle hop. Both need a `gost` binary and `curl`.
 
 Currently passing, both directions: `http`, `socks5`, `socks4`, `ss`
 (aes-256-gcm and chacha20-ietf-poly1305), `relay`, `tls`, `ws`, `wss`, `mtls`,
