@@ -1415,7 +1415,7 @@ making them cross-implementation rather than self-consistent.
 | Auto-detect handler | Working | Refuses SOCKS4 when credentials are configured, as gost does |
 | Proxy chain (multi-hop) | Partial | HTTP/SOCKS4/SOCKS4a/SOCKS5 connectors with authentication; unknown protocols are a hard error. No transport layer mid-chain |
 | Shadowsocks (TCP) | Working | Real AEAD: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305. Unknown ciphers fail closed |
-| Shadowsocks over UDP (`ssu`) | Absent | Rejected at startup; the UDP listener exists, the SS UDP handler does not |
+| Shadowsocks over UDP (`ssu`) | Working | `salt || AEAD(addr+payload)` per datagram with a zero nonce and a fresh salt; per-datagram ACL. No chain support (Chain::dial is TCP-only) |
 | Relay protocol | Working | Wire-compatible header, UDP length framing, lazy handshake |
 | TCP direct/remote forwarding | Working | Multi-target with a fail-filter selector |
 | UDP direct forwarding | Partial | Does not route through the chain; no idle expiry |
@@ -1443,7 +1443,7 @@ making them cross-implementation rather than self-consistent.
 | Obfuscation (ohttp / otls) | Types only | Handshake only; otls has no record framing |
 | Obfuscation (obfs4) | Absent | Dropped in go-gost v3 as well |
 | SSH tunnelling | Types only | Rejected at startup; russh is not wired |
-| Multiplexing (smux) | Absent | The existing frame layout is not smux-compatible |
+| Multiplexing (smux) | Working (v1) | Wire-verified against xtaci/smux v1.5.24: 8-byte little-endian header, keepalive, session-wide receive credit. v2 (`?smuxver=2`) is rejected rather than silently misbehaving. Not yet wired to `mtls`/`mws`/`mwss` |
 | TUN / TAP | Types only | Configures an existing interface; no device creation or packet loop |
 | FakeTCP, VSOCK | Types only | Need raw sockets and a vsock crate |
 | Socket mark / interface bind | Working on Linux | `-M` / `-I` applied to outbound sockets before connect; no-op elsewhere |

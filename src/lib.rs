@@ -77,7 +77,9 @@ pub use server::Server;
 pub use sni::SniHandler;
 pub use socks4::{Socks4Connector, Socks4Handler, Socks4aConnector};
 pub use socks5::{Socks5Connector, Socks5Handler};
-pub use ss::{ShadowConnector, ShadowHandler, SsCipher, SsStream};
+pub use ss::{
+    ShadowConnector, ShadowHandler, ShadowUdpConnector, ShadowUdpHandler, SsCipher, SsStream,
+};
 pub use ssh::{SshConfig, SshForwardHandler, SshTunnelTransporter};
 pub use tls_listener::TlsServer;
 pub use tuntap::{IpRoute, TapConfig, TapHandler, TunConfig, TunHandler};

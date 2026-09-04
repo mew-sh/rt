@@ -434,10 +434,23 @@ async fn run_server(
                 .unwrap_or_default();
             serve!(ShadowHandler::new(method, &password, handler_opts)?)
         }
-        // `ssu` is shadowsocks over UDP. There is no UDP listener abstraction
-        // yet, and serving it with the TCP handler would silently produce a
-        // TCP shadowsocks server under a UDP scheme.
-        "ssu" => return Err("ssu:// (shadowsocks over UDP) is not implemented".into()),
+        // Shadowsocks over UDP. `normalize_transport` maps the `ssu` scheme to
+        // the `udp` transport, so this is served by the UDP listener below.
+        "ssu" => {
+            let method = node
+                .user
+                .as_ref()
+                .map(|(m, _)| m.as_str())
+                .filter(|m| !m.is_empty())
+                .or_else(|| node.get("method"))
+                .unwrap_or("plain");
+            let password = node
+                .user
+                .as_ref()
+                .and_then(|(_, p)| p.clone())
+                .unwrap_or_default();
+            serve!(ss::ShadowUdpHandler::new(method, &password, handler_opts)?)
+        }
         "http2" => serve!(Http2Handler::new(handler_opts)),
         "relay" => serve!(RelayHandler::new(&remote, handler_opts)),
         "sni" => serve!(SniHandler::new(handler_opts)),
