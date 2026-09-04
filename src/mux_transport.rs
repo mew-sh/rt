@@ -698,6 +698,19 @@ pub struct MuxDialerPool {
     dialers: Mutex<HashMap<String, Arc<MuxDialer>>>,
 }
 
+impl std::fmt::Debug for MuxDialerPool {
+    // Hand-written because a dialer holds closures and live sessions, neither
+    // of which is Debug. `Chain` derives Debug and holds a pool, so it needs
+    // one; the key set is the only useful thing to show.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<String> = match self.dialers.lock() {
+            Ok(map) => map.keys().cloned().collect(),
+            Err(poisoned) => poisoned.into_inner().keys().cloned().collect(),
+        };
+        f.debug_struct("MuxDialerPool").field("nodes", &keys).finish()
+    }
+}
+
 impl MuxDialerPool {
     pub fn new() -> Self {
         Self {

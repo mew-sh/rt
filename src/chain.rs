@@ -18,6 +18,10 @@ pub struct Chain {
     pub timeout: Duration,
     pub hosts: Option<Hosts>,
     pub resolver: Option<crate::resolver::Resolver>,
+    /// Live smux sessions, keyed by hop. Shared across clones so every dial
+    /// through this chain reuses the same session per node — which is the
+    /// entire reason the multiplexed transports exist.
+    mux_dialers: std::sync::Arc<crate::mux_transport::MuxDialerPool>,
     node_groups: Vec<NodeGroup>,
     is_route: bool,
 }
@@ -32,6 +36,7 @@ impl Chain {
             timeout: Duration::ZERO,
             hosts: None,
             resolver: None,
+            mux_dialers: std::sync::Arc::new(crate::mux_transport::MuxDialerPool::new()),
             node_groups,
             is_route: false,
         }
@@ -45,6 +50,7 @@ impl Chain {
             timeout: Duration::ZERO,
             hosts: None,
             resolver: None,
+            mux_dialers: std::sync::Arc::new(crate::mux_transport::MuxDialerPool::new()),
             node_groups: Vec::new(),
             is_route: false,
         }
@@ -158,27 +164,102 @@ impl Chain {
             return Err(ChainError::EmptyChain);
         }
 
-        // Connect to first node
-        let first = &nodes[0];
-        debug!("[chain] connecting to first node: {}", first.addr);
-        let conn = self.connect_tcp(&first.addr, timeout).await?;
-
-        // Walk the chain, asking each node to connect to the next one, and the
-        // last node to connect to the real target. Each hop layers its
-        // transport first, then runs its protocol connector, matching gost's
-        // Dial -> Handshake -> Connect ordering (chain.go:286-319).
-        let mut current = ProxyConn::from_tcp(conn);
-        for (i, node) in nodes.iter().enumerate() {
-            let hop_target = if i == nodes.len() - 1 {
+        let hop_target = |i: usize| -> &str {
+            if i == nodes.len() - 1 {
                 target.as_str()
             } else {
                 nodes[i + 1].addr.as_str()
-            };
+            }
+        };
+
+        // The first hop. A multiplexed transport has to own its dial: it hands
+        // out a stream on a session it keeps alive across calls, so handing it
+        // a freshly dialled socket would build a session per dial and make
+        // `mtls` strictly more expensive than plain `tls`.
+        let first = &nodes[0];
+        debug!("[chain] connecting to first node: {}", first.addr);
+        let mut current = if is_mux_transport(&first.transport) {
+            self.dial_mux_hop(first, timeout).await?
+        } else {
+            let conn = self.connect_tcp(&first.addr, timeout).await?;
+            layer_transport(ProxyConn::from_tcp(conn), first).await?
+        };
+        current = connect_via(current, first, hop_target(0)).await?;
+
+        // Remaining hops: each is reached through the previous one, so it
+        // layers its transport over that connection and then runs its protocol
+        // connector — gost's Dial -> Handshake -> Connect order
+        // (chain.go:286-319).
+        for (i, node) in nodes.iter().enumerate().skip(1) {
+            if is_mux_transport(&node.transport) {
+                // Reaching it would mean building a session over the previous
+                // hop's connection, and a session per dial defeats the point.
+                // gost dials such a hop through a sub-chain; not implemented.
+                return Err(ChainError::ProxyError(format!(
+                    "chain node transport {:?} is only supported on the first hop (in {})",
+                    node.transport, node
+                )));
+            }
             current = layer_transport(current, node).await?;
-            current = connect_via(current, node, hop_target).await?;
+            current = connect_via(current, node, hop_target(i)).await?;
         }
 
         Ok(current)
+    }
+
+    /// Opens a stream on this hop's smux session, building the session (and the
+    /// TCP + TLS/WebSocket stack under it) the first time.
+    async fn dial_mux_hop(&self, node: &Node, timeout: Duration) -> Result<ProxyConn, ChainError> {
+        let mux = crate::mux_transport::mux_config_from_node(node)
+            .map_err(|e| ChainError::ProxyError(e.to_string()))?;
+
+        let addr = node.addr.clone();
+        let host = hop_hostname(node);
+        let insecure = !node.get_bool("secure");
+        let opts = ws_options_for(node);
+        let transport = node.transport.clone();
+
+        let dialer = self
+            .mux_dialers
+            .get_or_create(&format!("{}|{}", transport, addr), mux, move || {
+                let (addr, host, opts, transport) =
+                    (addr.clone(), host.clone(), opts.clone(), transport.clone());
+                async move {
+                    let tcp = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr))
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("timed out connecting to {}", addr),
+                            )
+                        })??;
+
+                    let inner: Box<dyn crate::conn::AsyncStream> = match transport.as_str() {
+                        "mtls" => Box::new(
+                            crate::tls_transport::tls_connect_stream(tcp, &host, insecure).await?,
+                        ),
+                        "mws" => {
+                            Box::new(crate::ws::ws_connect_stream(tcp, &host, "", &opts).await?)
+                        }
+                        // mwss: TLS first, then WebSocket over it.
+                        _ => {
+                            let tls =
+                                crate::tls_transport::tls_connect_stream(tcp, &host, insecure)
+                                    .await?;
+                            Box::new(crate::ws::ws_connect_stream(tls, &host, "", &opts).await?)
+                        }
+                    };
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(inner)
+                }
+            })
+            .map_err(|e| ChainError::ProxyError(e.to_string()))?;
+
+        let stream = dialer
+            .dial()
+            .await
+            .map_err(|e| ChainError::ProxyError(format!("{} hop failed: {}", node.transport, e)))?;
+
+        Ok(ProxyConn::layered(Box::new(stream), None, None))
     }
 
     /// Opens an outbound TCP connection, applying the chain's `-M` socket mark
@@ -338,6 +419,12 @@ async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, Ch
             other
         ))),
     }
+}
+
+/// Whether a hop's transport carries many streams over one session, and so
+/// must own its dial rather than be layered over a socket it is handed.
+fn is_mux_transport(transport: &str) -> bool {
+    matches!(transport, "mtls" | "mws" | "mwss")
 }
 
 /// The name to present to a hop's transport: `?host=` when set, else the

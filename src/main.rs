@@ -365,7 +365,10 @@ fn ensure_listener_transport_supported(
 
 fn ensure_chain_transport_supported(node: &Node) -> Result<(), Box<dyn std::error::Error>> {
     let transport = node.transport.as_str();
-    if matches!(transport, "" | "tcp" | "tls" | "ws" | "wss") {
+    if matches!(
+        transport,
+        "" | "tcp" | "tls" | "ws" | "wss" | "mtls" | "mws" | "mwss"
+    ) {
         return Ok(());
     }
     Err(format!(

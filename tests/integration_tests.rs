@@ -938,3 +938,93 @@ async fn integration_udp_listener_serves_a_handler_per_peer() {
         assert_eq!(&buf[..n], format!("echo:{}", msg).as_bytes());
     }
 }
+
+#[tokio::test]
+async fn integration_chain_through_an_mtls_proxy_reuses_one_session() {
+    // `-F http+mtls://proxy:443`: the hop layers TLS, builds an smux session,
+    // and opens a stream per dial. The point of the multiplexed variants is
+    // that a second dial does NOT open a second TCP connection.
+    let (target_addr, _target) = start_message_server(b"mtls-hop-ok").await;
+    let (target2_addr, _target2) = start_message_server(b"mtls-hop-ok-2").await;
+
+    let (config, _) = rustun::tls_listener::self_signed_config("localhost").unwrap();
+    let proxy = rustun::MuxServer::new_mtls(
+        "127.0.0.1:0",
+        config,
+        rustun::mux::MuxConfig::default(),
+        rustun::HttpHandler::new(rustun::HandlerOptions::default()),
+    )
+    .await
+    .unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let sessions = proxy.session_count();
+    let cancel = proxy.cancel_token();
+    tokio::spawn(async move {
+        proxy.serve().await.ok();
+    });
+
+    let node = rustun::Node::parse(&format!("http+mtls://{}", proxy_addr)).unwrap();
+    assert_eq!(node.transport, "mtls");
+    let chain = rustun::Chain::new(vec![node]);
+
+    // Two dials through the same chain.
+    let mut a = chain.dial(&target_addr.to_string()).await.unwrap();
+    let mut b = chain.dial(&target2_addr.to_string()).await.unwrap();
+
+    let mut buf = vec![0u8; 64];
+    let n = a.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"mtls-hop-ok");
+    let n = b.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"mtls-hop-ok-2");
+
+    assert_eq!(
+        sessions.get(),
+        1,
+        "two dials must share one smux session, not open a connection each"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn integration_chain_rejects_a_mux_hop_that_is_not_first() {
+    // A mux hop reached through an earlier hop would have to build its session
+    // over that hop's connection, which is a session per dial — the thing the
+    // multiplexed transports exist to avoid. It must be an explicit error.
+    // Hop 1 must genuinely work, otherwise the walk fails before it ever
+    // reaches hop 2 and the test would pass for the wrong reason.
+    let hop1_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hop1_addr = hop1_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = hop1_listener.accept().await {
+            let handler = rustun::HttpHandler::new(rustun::HandlerOptions::default());
+            tokio::spawn(async move {
+                handler.handle(rustun::ProxyConn::from_tcp(conn)).await.ok();
+            });
+        }
+    });
+
+    // Hop 2's address must accept a connection so hop 1's CONNECT succeeds.
+    let hop2_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hop2_addr = hop2_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((conn, _)) = hop2_listener.accept().await {
+            held.push(conn);
+        }
+    });
+
+    let first = rustun::Node::parse(&format!("http://{}", hop1_addr)).unwrap();
+    let second = rustun::Node::parse(&format!("http+mtls://{}", hop2_addr)).unwrap();
+    let chain = rustun::Chain::new(vec![first, second]);
+
+    let err = match chain.dial("example.com:80").await {
+        Ok(_) => panic!("a mux hop behind another hop must not succeed"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("only supported on the first hop"),
+        "expected a clear limitation error, got: {}",
+        err
+    );
+}
