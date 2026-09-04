@@ -1028,3 +1028,184 @@ async fn integration_chain_rejects_a_mux_hop_that_is_not_first() {
         err
     );
 }
+
+#[tokio::test]
+async fn integration_chain_dial_udp_is_direct_without_a_chain() {
+    use tokio::net::UdpSocket;
+
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1024];
+        let (n, from) = echo.recv_from(&mut buf).await.unwrap();
+        echo.send_to(&buf[..n], from).await.unwrap();
+    });
+
+    let chain = rustun::Chain::empty();
+    let ch = chain
+        .dial_udp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(!ch.is_tunnelled(), "an empty chain must dial UDP directly");
+
+    ch.send_to(b"direct", &echo_addr.ip().to_string(), echo_addr.port())
+        .await
+        .unwrap();
+    let (data, _, _) = tokio::time::timeout(Duration::from_secs(5), ch.recv_from())
+        .await
+        .expect("no reply")
+        .unwrap();
+    assert_eq!(&data, b"direct");
+}
+
+#[tokio::test]
+async fn integration_chain_dial_udp_tunnels_through_a_socks5_hop() {
+    // `-F socks5://` carrying UDP over the hop's TCP control connection
+    // (gost's CmdUDPTun). Without this, UDP leaks around the configured proxy.
+    use tokio::net::UdpSocket;
+
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let Ok((n, from)) = echo.recv_from(&mut buf).await else {
+                break;
+            };
+            let mut reply = b"echo:".to_vec();
+            reply.extend_from_slice(&buf[..n]);
+            if echo.send_to(&reply, from).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = proxy.accept().await {
+            let handler = rustun::Socks5Handler::new(rustun::HandlerOptions::default());
+            tokio::spawn(async move {
+                handler.handle(rustun::ProxyConn::from_tcp(conn)).await.ok();
+            });
+        }
+    });
+
+    let node = rustun::Node::parse(&format!("socks5://{}", proxy_addr)).unwrap();
+    let chain = rustun::Chain::new(vec![node]);
+
+    let ch = chain
+        .dial_udp("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(ch.is_tunnelled(), "a socks5 hop must tunnel UDP, not bypass it");
+
+    ch.send_to(b"hello", &echo_addr.ip().to_string(), echo_addr.port())
+        .await
+        .unwrap();
+
+    let (data, _, _) = tokio::time::timeout(Duration::from_secs(10), ch.recv_from())
+        .await
+        .expect("no reply came back through the tunnel")
+        .unwrap();
+    assert_eq!(&data, b"echo:hello");
+}
+
+#[tokio::test]
+async fn integration_chain_dial_udp_refuses_a_hop_that_cannot_carry_udp() {
+    // An http hop cannot carry UDP. Falling back to a direct send would route
+    // traffic around the proxy the operator configured, so it must fail.
+    let node = rustun::Node::parse("http://127.0.0.1:1").unwrap();
+    let chain = rustun::Chain::new(vec![node]);
+
+    let err = match chain.dial_udp("127.0.0.1:0".parse().unwrap()).await {
+        Ok(_) => panic!("an http hop must not silently send UDP directly"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("cannot carry UDP"), "got: {}", err);
+}
+
+#[tokio::test]
+async fn integration_ssu_relays_through_a_socks5_chain() {
+    // `-L ssu:// -F socks5://`: the shadowsocks UDP relay must send its
+    // datagrams through the configured proxy, not around it.
+    use tokio::net::UdpSocket;
+
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let Ok((n, from)) = echo.recv_from(&mut buf).await else {
+                break;
+            };
+            let mut reply = b"ss-udp:".to_vec();
+            reply.extend_from_slice(&buf[..n]);
+            if echo.send_to(&reply, from).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // The SOCKS5 hop that will carry the datagrams over its TCP connection.
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = proxy.accept().await {
+            let handler = rustun::Socks5Handler::new(rustun::HandlerOptions::default());
+            tokio::spawn(async move {
+                handler.handle(rustun::ProxyConn::from_tcp(conn)).await.ok();
+            });
+        }
+    });
+
+    let hop = rustun::Node::parse(&format!("socks5://{}", proxy_addr)).unwrap();
+    let chain = rustun::Chain::new(vec![hop]);
+
+    let handler = rustun::ShadowUdpHandler::new(
+        "aes-256-gcm",
+        "pw",
+        rustun::HandlerOptions {
+            chain: Some(chain),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let ssu = rustun::UdpServer::new(
+        "127.0.0.1:0",
+        rustun::UdpListenConfig::default(),
+        handler,
+    )
+    .await
+    .unwrap();
+    let ssu_addr = ssu.local_addr();
+    let cancel = ssu.cancel_token();
+    tokio::spawn(async move {
+        ssu.serve().await.ok();
+    });
+
+    // A shadowsocks UDP client: salt || AEAD(addr || payload).
+    let connector = rustun::ShadowUdpConnector::new("aes-256-gcm", "pw").unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let frame = connector
+        .encode_to(&echo_addr.to_string(), b"through-the-chain")
+        .unwrap();
+    client.send_to(&frame, ssu_addr).await.unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(10), client.recv_from(&mut buf))
+        .await
+        .expect("no reply came back through the ssu chain")
+        .unwrap();
+
+    let (origin, payload) = connector.decode_from(&buf[..n]).unwrap();
+    assert_eq!(payload, b"ss-udp:through-the-chain");
+    assert_eq!(
+        origin,
+        echo_addr.to_string(),
+        "the reply must be attributed to the real target, not the proxy"
+    );
+
+    cancel.cancel();
+}

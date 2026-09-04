@@ -888,18 +888,17 @@ impl ShadowUdpHandler {
     async fn relay(
         &self,
         conn: &mut ProxyConn,
-        target_sock: &UdpSocket,
+        out: &crate::chain::UdpChannel,
         peer_addr: &str,
     ) -> Result<(), HandlerError> {
         // A datagram whose length exceeds this cannot exist on the wire, so a
         // full frame is always delivered by a single read.
         let mut cbuf = vec![0u8; UDP_MAX_DATAGRAM];
-        let mut tbuf = vec![0u8; UDP_MAX_DATAGRAM];
         let mut consecutive_recv_errors = 0u32;
 
         enum Ev {
             FromClient(io::Result<usize>),
-            FromTarget(io::Result<(usize, SocketAddr)>),
+            FromTarget(io::Result<(Vec<u8>, String, u16)>),
         }
 
         loop {
@@ -908,7 +907,7 @@ impl ShadowUdpHandler {
             // before the datagram is inspected and relayed.
             let ev = tokio::select! {
                 r = conn.read(&mut cbuf) => Ev::FromClient(r),
-                r = target_sock.recv_from(&mut tbuf) => Ev::FromTarget(r),
+                r = out.recv_from() => Ev::FromTarget(r),
             };
 
             match ev {
@@ -960,7 +959,10 @@ impl ShadowUdpHandler {
                         plain.len() - off
                     );
                     // One unreachable target must not end the association.
-                    if let Err(e) = target_sock.send_to(&plain[off..], raddr).await {
+                    if let Err(e) = out
+                        .send_to(&plain[off..], &raddr.ip().to_string(), raddr.port())
+                        .await
+                    {
                         debug!("[ssu] {} >>> {} : {}", peer_addr, target, e);
                     }
                 }
@@ -977,9 +979,14 @@ impl ShadowUdpHandler {
                         return Err(HandlerError::Io(e));
                     }
                 }
-                Ev::FromTarget(Ok((n, from))) => {
+                Ev::FromTarget(Ok((data, host, port))) => {
                     consecutive_recv_errors = 0;
-                    let origin = from.to_string();
+                    let n = data.len();
+                    let origin = if host.contains(':') {
+                        format!("[{}]:{}", host, port)
+                    } else {
+                        format!("{}:{}", host, port)
+                    };
                     // gost applies the bypass to the reply's source too
                     // (ss.go:465).
                     if let Some(bypass) = self.options.bypass.as_ref() {
@@ -990,9 +997,8 @@ impl ShadowUdpHandler {
                     }
 
                     debug!("[ssu] {} <<< {} length: {}", peer_addr, origin, n);
-                    let mut plain = Vec::with_capacity(19 + n);
-                    encode_ss_socket_addr(&from, &mut plain);
-                    plain.extend_from_slice(&tbuf[..n]);
+                    let mut plain = encode_ss_target(&origin)?;
+                    plain.extend_from_slice(&data);
                     let packet = seal_udp_datagram(&self.cipher, &self.key, &plain)?;
                     conn.write_all(&packet).await?;
                 }
@@ -1011,22 +1017,24 @@ impl Handler for ShadowUdpHandler {
         let peer_addr = conn.peer_addr_str();
         let local_addr = conn.local_addr_str();
 
-        // Bind the target-facing socket in the listener's address family, so an
-        // IPv6 listener can reach IPv6 targets. gost gets this socket from the
-        // chain (ss.go:300); this crate's chain only dials TCP, so the relay
-        // goes out directly, as the SOCKS5 UDP relay in socks5.rs does.
+        // The outbound side comes from the chain, as in gost (ss.go:300): with
+        // no chain it is a plain socket, and behind a SOCKS5 hop it is a
+        // CmdUDPTun tunnel, so datagrams do not bypass the configured proxy.
+        // The bind address follows the listener's family, so an IPv6 listener
+        // can reach IPv6 targets.
         let bind: SocketAddr = match conn.local_addr().map(|a| a.ip()) {
             Some(IpAddr::V6(_)) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
             _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         };
-        let target_sock = UdpSocket::bind(bind).await?;
+        let chain = self.options.chain.as_ref().cloned().unwrap_or_default();
+        let out = chain.dial_udp(bind).await?;
 
         info!("[ssu] {} <-> {}", peer_addr, local_addr);
-        let result = self.relay(&mut conn, &target_sock, &peer_addr).await;
+        let result = self.relay(&mut conn, &out, &peer_addr).await;
         info!("[ssu] {} >-< {}", peer_addr, local_addr);
 
-        // `target_sock` is dropped here, closing the association's outbound
-        // socket the moment the client's virtual connection ends.
+        // `out` is dropped here, closing the association's outbound socket
+        // or tunnel the moment the client's virtual connection ends.
         result
     }
 }

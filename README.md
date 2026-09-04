@@ -1426,13 +1426,13 @@ making them cross-implementation rather than self-consistent.
 | SOCKS5 CONNECT | Working | User/pass auth, IPv4/IPv6/domain, all-zero bound address in the reply |
 | SOCKS5 UDP ASSOCIATE | Working | Real relay socket, per-datagram ACL, fragments dropped, torn down with the control connection |
 | SOCKS5 BIND | Working | Two-reply sequence |
-| SOCKS5 `CmdUDPTun` (0xF3) | Working (server) | UDP over the TCP control connection, with the length carried in the repurposed `RSV` field as gost does. Client side exists; not yet wired to a chain hop |
+| SOCKS5 `CmdUDPTun` (0xF3) | Working | UDP over the TCP control connection, with the length carried in the repurposed `RSV` field as gost does. `Chain::dial_udp` uses it, so `-F socks5://` carries UDP |
 | SOCKS5 other gost extensions | Absent | MethodTLS 0x80, MethodTLSAuth 0x82, CmdMuxBind 0xF2 |
 | SOCKS4/4a proxy | Working | CONNECT and BIND |
 | Auto-detect handler | Working | Refuses SOCKS4 when credentials are configured, as gost does |
 | Proxy chain (multi-hop) | Partial | HTTP/SOCKS4/SOCKS4a/SOCKS5 connectors with authentication; unknown protocols are a hard error. No transport layer mid-chain |
 | Shadowsocks (TCP) | Working | Real AEAD: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305. Unknown ciphers fail closed |
-| Shadowsocks over UDP (`ssu`) | Working | `salt || AEAD(addr+payload)` per datagram with a zero nonce and a fresh salt; per-datagram ACL. No chain support (Chain::dial is TCP-only) |
+| Shadowsocks over UDP (`ssu`) | Working | `salt || AEAD(addr+payload)` per datagram with a zero nonce and a fresh salt; per-datagram ACL. Relays through a SOCKS5 chain hop via `CmdUDPTun` |
 | Relay protocol | Working | Wire-compatible header, UDP length framing, lazy handshake |
 | TCP direct/remote forwarding | Working | Multi-target with a fail-filter selector |
 | UDP direct forwarding | Partial | Does not route through the chain; no idle expiry |

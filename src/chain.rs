@@ -207,6 +207,82 @@ impl Chain {
         Ok(current)
     }
 
+    /// Opens an outbound datagram channel, tunnelling it through the chain when
+    /// the last hop can carry UDP.
+    ///
+    /// With no chain, this is a plain UDP socket. With a SOCKS5 last hop it is
+    /// gost's `CmdUDPTun` (0xF3), which carries datagrams over that hop's TCP
+    /// control connection. Any other last hop cannot carry UDP, and that is an
+    /// error rather than a silent direct send that would leak traffic around
+    /// the proxy the operator configured.
+    pub async fn dial_udp(&self, bind: std::net::SocketAddr) -> Result<UdpChannel, ChainError> {
+        if self.is_empty() {
+            let sock = tokio::net::UdpSocket::bind(bind)
+                .await
+                .map_err(ChainError::Io)?;
+            return Ok(UdpChannel::Direct(sock));
+        }
+
+        let last = self.last_node();
+        if last.protocol != "socks5" && last.protocol != "socks" {
+            return Err(ChainError::ProxyError(format!(
+                "chain last hop {:?} cannot carry UDP; only socks5 supports it (via CmdUDPTun)",
+                last.protocol
+            )));
+        }
+
+        // Reach the last hop through the rest of the chain, then ask it to
+        // open a UDP association we tunnel over that same connection.
+        let control = self.dial(&last.addr).await?;
+        let connector = crate::socks5::Socks5Connector::new(last.user.clone());
+        let tunnel = connector
+            .udp_tunnel(control, "0.0.0.0:0", None)
+            .await
+            .map_err(|e| ChainError::ProxyError(format!("socks5 UDP tunnel failed: {}", e)))?;
+
+        // A single TCP stream cannot serve concurrent reads and writes without
+        // interleaving frames, so split it into pump tasks behind channels.
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, String, u16)>(128);
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, String, u16)>(128);
+
+        let tunnel = std::sync::Arc::new(tokio::sync::Mutex::new(tunnel));
+        let writer_tunnel = tunnel.clone();
+        let writer = tokio::spawn(async move {
+            while let Some((data, host, port)) = out_rx.recv().await {
+                if writer_tunnel
+                    .lock()
+                    .await
+                    .send_to(&data, &host, port)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let reader = tokio::spawn(async move {
+            loop {
+                let received = { tunnel.lock().await.recv_from().await };
+                match received {
+                    Ok(Some((data, host, port))) => {
+                        if in_tx.send((data, host, port)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // A clean end of stream or a framing error both end the
+                    // association; the consumer sees the channel close.
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        });
+
+        Ok(UdpChannel::Tunnel {
+            tx: out_tx,
+            rx: tokio::sync::Mutex::new(in_rx),
+            _pump: DropGuard(vec![writer, reader]),
+        })
+    }
+
     /// Opens a stream on this hop's smux session, building the session (and the
     /// TCP + TLS/WebSocket stack under it) the first time.
     async fn dial_mux_hop(&self, node: &Node, timeout: Duration) -> Result<ProxyConn, ChainError> {
@@ -418,6 +494,75 @@ async fn layer_transport(stream: ProxyConn, node: &Node) -> Result<ProxyConn, Ch
             "chain node transport {:?} is not implemented",
             other
         ))),
+    }
+}
+
+/// An outbound datagram channel: either a real UDP socket, or UDP tunnelled
+/// over a SOCKS5 hop's TCP control connection.
+///
+/// gost gets this from `Chain.DialContext(ctx, "udp", ...)` (ss.go:300), which
+/// is what lets `-L ssu://` and `-L udp://` relay through an upstream proxy.
+///
+/// Both variants expose `send_to`/`recv_from` taking `&self`, so a relay loop
+/// can `select!` over them concurrently. A UDP socket supports that natively;
+/// the tunnel is a single TCP stream, where frames must not interleave, so it
+/// is driven by reader and writer tasks behind channels rather than a lock
+/// that a blocked read would hold.
+pub enum UdpChannel {
+    Direct(tokio::net::UdpSocket),
+    Tunnel {
+        tx: tokio::sync::mpsc::Sender<(Vec<u8>, String, u16)>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Vec<u8>, String, u16)>>,
+        /// Aborts the pump tasks when the channel is dropped, so a finished
+        /// association does not leave the tunnel running.
+        _pump: DropGuard,
+    },
+}
+
+/// Aborts a set of tasks on drop.
+pub struct DropGuard(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for DropGuard {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
+impl UdpChannel {
+    pub async fn send_to(&self, data: &[u8], host: &str, port: u16) -> std::io::Result<()> {
+        match self {
+            UdpChannel::Direct(sock) => {
+                let addr = join_host_port(host, port);
+                sock.send_to(data, &addr).await.map(|_| ())
+            }
+            UdpChannel::Tunnel { tx, .. } => tx
+                .send((data.to_vec(), host.to_string(), port))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "udp tunnel closed")
+                }),
+        }
+    }
+
+    /// Receives one datagram with its source address.
+    pub async fn recv_from(&self) -> std::io::Result<(Vec<u8>, String, u16)> {
+        match self {
+            UdpChannel::Direct(sock) => {
+                let mut buf = vec![0u8; 64 * 1024];
+                let (n, from) = sock.recv_from(&mut buf).await?;
+                buf.truncate(n);
+                Ok((buf, from.ip().to_string(), from.port()))
+            }
+            UdpChannel::Tunnel { rx, .. } => rx.lock().await.recv().await.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "udp tunnel closed")
+            }),
+        }
+    }
+
+    pub fn is_tunnelled(&self) -> bool {
+        matches!(self, UdpChannel::Tunnel { .. })
     }
 }
 
