@@ -77,9 +77,9 @@ fn request_target<T>(request: &Request<T>) -> Option<String> {
     let uri = request.uri();
     let host = uri.host()?;
     let port = uri.port_u16().unwrap_or_else(|| {
-        if request.method() == Method::CONNECT {
-            443
-        } else if uri.scheme_str() == Some("https") {
+        // CONNECT names an authority with no scheme, and gost treats it as
+        // TLS-bound; an absolute URI supplies its own default.
+        if request.method() == Method::CONNECT || uri.scheme_str() == Some("https") {
             443
         } else {
             80

@@ -405,7 +405,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObfsTlsStream<S> {
     ) -> Poll<io::Result<usize>> {
         // Anything already encoded, including a deferred server reply, has to
         // reach the socket before a new record is queued behind it.
-        if let Poll::Pending = self.flush_out(cx) {
+        if self.flush_out(cx).is_pending() {
             return Poll::Pending;
         }
         if buf.is_empty() {
