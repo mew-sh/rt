@@ -271,7 +271,8 @@ fn build_handler_options(node: &Node, mut chain: Chain) -> HandlerOptions {
             timeout,
             node.get_duration("ttl"),
             node.get("prefer").unwrap_or(""),
-            node.get("ip").and_then(|s| s.parse::<std::net::IpAddr>().ok()),
+            node.get("ip")
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok()),
         );
         if let Some(spec) = node.get("dns") {
             spawn_period_reload(r.clone(), spec);
@@ -477,7 +478,10 @@ async fn run_server(
         "dns" | "dot" | "doh" => serve!(DnsHandler::new(&remote, handler_opts)),
         "red" | "redirect" => serve!(TcpRedirectHandler::new(handler_opts), true),
         "redu" | "redirectu" => serve!(redirect::UdpRedirectHandler::new(handler_opts)),
-        "forward" => serve!(SshForwardHandler::new(handler_opts, SshConfig::from_node(&node))?),
+        "forward" => serve!(SshForwardHandler::new(
+            handler_opts,
+            SshConfig::from_node(&node)
+        )?),
         _ => {
             if !remote.is_empty() {
                 serve!(TcpDirectForwardHandler::new(&remote, handler_opts))
@@ -651,15 +655,19 @@ fn tls_server_config(
     let key = node.get("key").unwrap_or("");
 
     if !cert.is_empty() && !key.is_empty() {
-        return tls_listener::server_config_from_files(cert, key)
-            .map_err(|e| format!("failed to load the TLS key pair {} / {}: {}", cert, key, e).into());
+        return tls_listener::server_config_from_files(cert, key).map_err(|e| {
+            format!("failed to load the TLS key pair {} / {}: {}", cert, key, e).into()
+        });
     }
 
     warn!(
         "[tls] no cert/key configured for {}; generating a self-signed certificate",
         node
     );
-    let host = node.get("host").filter(|h| !h.is_empty()).unwrap_or("localhost");
+    let host = node
+        .get("host")
+        .filter(|h| !h.is_empty())
+        .unwrap_or("localhost");
     let (config, _cert_pem) = tls_listener::self_signed_config(host)?;
     Ok(config)
 }

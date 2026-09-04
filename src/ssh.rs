@@ -163,7 +163,10 @@ impl std::fmt::Debug for SshConfig {
         f.debug_struct("SshConfig")
             .field("key_file", &self.key_file)
             .field("authorized_keys_file", &self.authorized_keys_file)
-            .field("key_passphrase", &self.key_passphrase.as_ref().map(|_| "<redacted>"))
+            .field(
+                "key_passphrase",
+                &self.key_passphrase.as_ref().map(|_| "<redacted>"),
+            )
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("user", &self.user)
             .field("host_key_file", &self.host_key_file)
@@ -183,7 +186,10 @@ impl SshConfig {
             None => (None, None),
         };
         Self {
-            key_file: node.get("ssh_key").filter(|s| !s.is_empty()).map(String::from),
+            key_file: node
+                .get("ssh_key")
+                .filter(|s| !s.is_empty())
+                .map(String::from),
             authorized_keys_file: node
                 .get("ssh_authorized_keys")
                 .filter(|s| !s.is_empty())
@@ -223,9 +229,8 @@ impl SshConfig {
 /// and PuTTY, encrypted or not. gost's `ssh.ParsePrivateKey` handles only
 /// unencrypted keys, so `passphrase` is a superset of its behaviour.
 pub fn parse_ssh_key_file(path: &str, passphrase: Option<&str>) -> Result<PrivateKey, SshError> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        SshError::Config(format!("cannot read ssh key file {:?}: {}", path, e))
-    })?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| SshError::Config(format!("cannot read ssh key file {:?}: {}", path, e)))?;
     decode_secret_key(&text, passphrase)
         .map_err(|e| SshError::Config(format!("cannot parse ssh key file {:?}: {}", path, e)))
 }
@@ -251,9 +256,8 @@ impl AuthorizedKeys {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let key = PublicKey::from_openssh(line).map_err(|e| {
-                SshError::Config(format!("authorized_keys line {}: {}", n + 1, e))
-            })?;
+            let key = PublicKey::from_openssh(line)
+                .map_err(|e| SshError::Config(format!("authorized_keys line {}: {}", n + 1, e)))?;
             fingerprints.insert(fingerprint(&key));
         }
         Ok(Self { fingerprints })
@@ -276,7 +280,10 @@ impl AuthorizedKeys {
 /// (ssh.go:42-58).
 pub fn parse_ssh_authorized_keys_file(path: &str) -> Result<AuthorizedKeys, SshError> {
     let text = std::fs::read_to_string(path).map_err(|e| {
-        SshError::Config(format!("cannot read authorized_keys file {:?}: {}", path, e))
+        SshError::Config(format!(
+            "cannot read authorized_keys file {:?}: {}",
+            path, e
+        ))
     })?;
     AuthorizedKeys::parse(&text)
 }
@@ -600,10 +607,17 @@ impl ForwardSession {
 impl russh::server::Handler for ForwardSession {
     type Error = SshError;
 
-    async fn auth_password(&mut self, user: &str, password: &str) -> Result<russh::server::Auth, Self::Error> {
+    async fn auth_password(
+        &mut self,
+        user: &str,
+        password: &str,
+    ) -> Result<russh::server::Auth, Self::Error> {
         if self.auth.check_password(user, password) {
             self.user = user.to_string();
-            debug!("[ssh-forward] {} authenticated as {:?} by password", self.peer_addr, user);
+            debug!(
+                "[ssh-forward] {} authenticated as {:?} by password",
+                self.peer_addr, user
+            );
             return Ok(russh::server::Auth::Accept);
         }
         warn!(
@@ -762,7 +776,10 @@ impl russh::server::Handler for ForwardSession {
                     {
                         Ok(c) => c,
                         Err(e) => {
-                            warn!("[ssh-rtcp] open {} channel: {}", FORWARDED_TCP_RETURN_REQUEST, e);
+                            warn!(
+                                "[ssh-rtcp] open {} channel: {}",
+                                FORWARDED_TCP_RETURN_REQUEST, e
+                            );
                             return;
                         }
                     };
@@ -786,7 +803,10 @@ impl russh::server::Handler for ForwardSession {
         match self.forwards.remove(&(address.to_string(), port)) {
             Some(cancel) => {
                 cancel.cancel();
-                debug!("[ssh-rtcp] {} {}:{}", CANCEL_REMOTE_FORWARD_REQUEST, address, port);
+                debug!(
+                    "[ssh-rtcp] {} {}:{}",
+                    CANCEL_REMOTE_FORWARD_REQUEST, address, port
+                );
                 Ok(true)
             }
             None => Ok(false),
@@ -843,7 +863,11 @@ impl SshSession {
                 ))
             })?;
         debug!("[ssh-tcp] {} -> {}", self.addr, raddr);
-        Ok(ProxyConn::layered(Box::new(channel.into_stream()), None, None))
+        Ok(ProxyConn::layered(
+            Box::new(channel.into_stream()),
+            None,
+            None,
+        ))
     }
 
     /// Asks the server to bind `address` and stream back the connections it
@@ -1083,7 +1107,9 @@ impl SshForwardTransporter {
             self.handshake(stream, addr),
         )
         .await
-        .map_err(|_| SshError::Protocol(format!("timed out in the SSH handshake with {}", addr)))??;
+        .map_err(|_| {
+            SshError::Protocol(format!("timed out in the SSH handshake with {}", addr))
+        })??;
 
         let session = Arc::new(session);
         sessions.insert(addr.to_string(), session.clone());
@@ -1348,8 +1374,11 @@ mod tests {
     /// Nothing is committed to the repository, as required.
     fn temp_key_file(name: &str) -> (String, PrivateKey) {
         let key = generate_host_key().unwrap();
-        let pem = key.to_openssh(russh::keys::ssh_key::LineEnding::LF).unwrap();
-        let path = std::env::temp_dir().join(format!("rt-ssh-test-{}-{}", std::process::id(), name));
+        let pem = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("rt-ssh-test-{}-{}", std::process::id(), name));
         std::fs::write(&path, pem.as_bytes()).unwrap();
         (path.to_string_lossy().into_owned(), key)
     }
@@ -1371,7 +1400,11 @@ mod tests {
             ..Default::default()
         };
         let rendered = format!("{:?}", config);
-        assert!(!rendered.contains("hunter2"), "password leaked: {}", rendered);
+        assert!(
+            !rendered.contains("hunter2"),
+            "password leaked: {}",
+            rendered
+        );
         assert!(rendered.contains("bob"));
     }
 
@@ -1394,7 +1427,10 @@ mod tests {
     fn test_parse_ssh_key_file_roundtrip() {
         let (path, key) = temp_key_file("roundtrip");
         let loaded = parse_ssh_key_file(&path, None).unwrap();
-        assert_eq!(fingerprint(&loaded.public_key()), fingerprint(&key.public_key()));
+        assert_eq!(
+            fingerprint(&loaded.public_key()),
+            fingerprint(&key.public_key())
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -1471,8 +1507,7 @@ mod tests {
     #[test]
     fn test_forward_handler_accepts_authorized_keys_only() {
         let key = generate_host_key().unwrap();
-        let path = std::env::temp_dir()
-            .join(format!("rt-ssh-test-ak-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("rt-ssh-test-ak-{}", std::process::id()));
         std::fs::write(&path, key.public_key().to_openssh().unwrap()).unwrap();
 
         let config = SshConfig {
@@ -1494,7 +1529,9 @@ mod tests {
     #[test]
     fn test_tunnel_transport_is_a_hard_error() {
         // Never a silent plaintext relay: both halves refuse to be built.
-        let e = SshTunnelTransporter::new(SshConfig::default()).err().unwrap();
+        let e = SshTunnelTransporter::new(SshConfig::default())
+            .err()
+            .unwrap();
         assert!(e.to_string().contains("gost-tunnel"), "got: {}", e);
         let e = SshTunnelListener::new("127.0.0.1:0", SshConfig::default())
             .err()
@@ -1513,10 +1550,18 @@ mod tests {
             );
         }
         for p in ["direct", "remote", "forward"] {
-            assert!(ssh_chain_support(p).is_ok(), "{}+ssh chain must be allowed", p);
+            assert!(
+                ssh_chain_support(p).is_ok(),
+                "{}+ssh chain must be allowed",
+                p
+            );
         }
         for p in ["http", "socks5", ""] {
-            assert!(ssh_chain_support(p).is_err(), "{}+ssh chain must be rejected", p);
+            assert!(
+                ssh_chain_support(p).is_err(),
+                "{}+ssh chain must be rejected",
+                p
+            );
         }
     }
 
@@ -1623,8 +1668,7 @@ mod tests {
     #[tokio::test]
     async fn test_public_key_auth_end_to_end() {
         let (key_path, key) = temp_key_file("pubkey-auth");
-        let ak_path = std::env::temp_dir()
-            .join(format!("rt-ssh-test-ak2-{}", std::process::id()));
+        let ak_path = std::env::temp_dir().join(format!("rt-ssh-test-ak2-{}", std::process::id()));
         std::fs::write(&ak_path, key.public_key().to_openssh().unwrap()).unwrap();
 
         let (ssh_addr, target_addr) = start_forward_server(
@@ -1659,8 +1703,7 @@ mod tests {
     async fn test_unauthorized_key_is_rejected() {
         let (key_path, _) = temp_key_file("bad-pubkey");
         let authorized = generate_host_key().unwrap();
-        let ak_path = std::env::temp_dir()
-            .join(format!("rt-ssh-test-ak3-{}", std::process::id()));
+        let ak_path = std::env::temp_dir().join(format!("rt-ssh-test-ak3-{}", std::process::id()));
         std::fs::write(&ak_path, authorized.public_key().to_openssh().unwrap()).unwrap();
 
         let (ssh_addr, _) = start_forward_server(
@@ -1715,8 +1758,7 @@ mod tests {
         // Pin an unrelated key: the handshake must fail rather than proceed and
         // hand the password to whoever answered.
         let other = generate_host_key().unwrap();
-        let pin_path = std::env::temp_dir()
-            .join(format!("rt-ssh-test-pin-{}", std::process::id()));
+        let pin_path = std::env::temp_dir().join(format!("rt-ssh-test-pin-{}", std::process::id()));
         std::fs::write(&pin_path, other.public_key().to_openssh().unwrap()).unwrap();
 
         let client = SshForwardTransporter::new(SshConfig {
@@ -1743,8 +1785,8 @@ mod tests {
         )
         .await;
 
-        let pin_path = std::env::temp_dir()
-            .join(format!("rt-ssh-test-pin2-{}", std::process::id()));
+        let pin_path =
+            std::env::temp_dir().join(format!("rt-ssh-test-pin2-{}", std::process::id()));
         std::fs::write(&pin_path, key.public_key().to_openssh().unwrap()).unwrap();
 
         let client = SshForwardTransporter::new(SshConfig {

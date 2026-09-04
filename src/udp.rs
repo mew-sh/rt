@@ -359,7 +359,10 @@ async fn demux_loop(
                 continue;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                debug!("[udp] {} : listener closed, stopping demux loop", local_addr);
+                debug!(
+                    "[udp] {} : listener closed, stopping demux loop",
+                    local_addr
+                );
                 break;
             }
         }
@@ -781,9 +784,13 @@ mod tests {
         assert_eq!(from_a.local_addr(), addr);
 
         let mut buf = [0u8; 64];
-        let n = read_within(&mut from_a, 500, &mut buf).await.expect("read a");
+        let n = read_within(&mut from_a, 500, &mut buf)
+            .await
+            .expect("read a");
         assert_eq!(&buf[..n], b"from-a");
-        let n = read_within(&mut from_b, 500, &mut buf).await.expect("read b");
+        let n = read_within(&mut from_b, 500, &mut buf)
+            .await
+            .expect("read b");
         assert_eq!(&buf[..n], b"from-b");
     }
 

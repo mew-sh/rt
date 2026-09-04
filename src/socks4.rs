@@ -155,7 +155,13 @@ impl Socks4Handler {
             match chain.dial_with_options(target, &opts).await {
                 Ok(cc) => return Ok(cc),
                 Err(e) => {
-                    debug!("[socks4] dial {} attempt {}/{}: {}", target, i + 1, retries, e);
+                    debug!(
+                        "[socks4] dial {} attempt {}/{}: {}",
+                        target,
+                        i + 1,
+                        retries,
+                        e
+                    );
                     last_err = e;
                 }
             }
@@ -184,7 +190,10 @@ impl Socks4Handler {
             self.options.whitelist.as_ref(),
             self.options.blacklist.as_ref(),
         ) {
-            warn!("[socks4] {} - unauthorized to tcp connect to {}", peer_addr, target);
+            warn!(
+                "[socks4] {} - unauthorized to tcp connect to {}",
+                peer_addr, target
+            );
             send_reply(&mut conn, REP_REJECTED, "0.0.0.0", 0).await?;
             return Err(HandlerError::Forbidden);
         }
@@ -234,7 +243,10 @@ impl Socks4Handler {
             self.options.whitelist.as_ref(),
             self.options.blacklist.as_ref(),
         ) {
-            warn!("[socks4-bind] {} - unauthorized to tcp bind to {}", peer_addr, target);
+            warn!(
+                "[socks4-bind] {} - unauthorized to tcp bind to {}",
+                peer_addr, target
+            );
             send_reply(&mut conn, REP_REJECTED, "0.0.0.0", 0).await?;
             return Err(HandlerError::Forbidden);
         }
@@ -348,7 +360,10 @@ async fn socks4_bind_on(
             Err(HandlerError::Io(e))
         }
         Ev::Closed => {
-            debug!("[socks4-bind] {} - control connection closed while binding", peer_addr);
+            debug!(
+                "[socks4-bind] {} - control connection closed while binding",
+                peer_addr
+            );
             Ok(())
         }
     }
@@ -434,12 +449,7 @@ impl Handler for Socks4Handler {
 
 /// Generic over the stream so the same reply writer serves a `ProxyConn`
 /// control connection and a plain `TcpStream`.
-async fn send_reply<S>(
-    conn: &mut S,
-    code: u8,
-    addr: &str,
-    port: u16,
-) -> Result<(), HandlerError>
+async fn send_reply<S>(conn: &mut S, code: u8, addr: &str, port: u16) -> Result<(), HandlerError>
 where
     S: AsyncWrite + Unpin + Send + ?Sized,
 {
@@ -630,7 +640,10 @@ mod tests {
         // First reply: the bound address.
         let (code, ip, port) = read_reply(&mut client).await;
         assert_eq!(code, REP_GRANTED);
-        assert_ne!(port, 0, "the first BIND reply must carry the real bound port");
+        assert_ne!(
+            port, 0,
+            "the first BIND reply must carry the real bound port"
+        );
         let bound = SocketAddr::new(IpAddr::V4(ip), port);
 
         // A peer connects to the bound address.
@@ -721,7 +734,10 @@ mod tests {
             ..Default::default()
         })
         .dial_setup();
-        assert_eq!(r, 5, "the chain's Retries must be used when the handler's is 0");
+        assert_eq!(
+            r, 5,
+            "the chain's Retries must be used when the handler's is 0"
+        );
         assert_eq!(c.retries, 1, "the inner chain loop must not retry as well");
 
         // Handler wins over chain (gost socks.go:1733-1739).

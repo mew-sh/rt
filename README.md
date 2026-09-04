@@ -61,7 +61,7 @@ rt -V
 Output:
 
 ```
-rt 0.1.0 (rustc windows/x86_64)
+rt 2.0.0 (rustc windows/x86_64)
 ```
 
 ---
@@ -222,7 +222,7 @@ Prints the version string and exits immediately. The output format is `rt <versi
 
 ```bash
 rt -V
-# Output: rt 0.1.0 (rustc windows/x86_64)
+# Output: rt 2.0.0 (rustc windows/x86_64)
 ```
 
 ### -P (Profiling)

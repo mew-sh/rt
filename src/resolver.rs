@@ -913,9 +913,7 @@ pub async fn ns_exchange(
     match proto {
         NsProtocol::Udp => exchange_udp(&ns.dial_addr(), query, timeout).await,
         NsProtocol::Tcp => exchange_tcp(&ns.dial_addr(), query, timeout, chain).await,
-        NsProtocol::Tls => {
-            exchange_tls(&ns.dial_addr(), &ns.hostname, query, timeout, chain).await
-        }
+        NsProtocol::Tls => exchange_tls(&ns.dial_addr(), &ns.hostname, query, timeout, chain).await,
         NsProtocol::Https => exchange_doh(&ns.addr, &ns.hostname, query, timeout, chain).await,
     }
 }
@@ -1144,7 +1142,10 @@ impl Resolver {
 
     /// The inline, comma separated form accepted by gost's `parseResolver`.
     pub fn from_inline(cfg: &str) -> Resolver {
-        let servers = cfg.split(',').filter_map(|s| parse_ns_spec(s.trim())).collect();
+        let servers = cfg
+            .split(',')
+            .filter_map(|s| parse_ns_spec(s.trim()))
+            .collect();
         Resolver::with_servers(servers)
     }
 
@@ -1738,7 +1739,9 @@ mod tests {
             back.answer_ips(),
             vec![
                 "93.184.216.34".parse::<IpAddr>().unwrap(),
-                "2606:2800:220:1:248:1893:25c8:1946".parse::<IpAddr>().unwrap(),
+                "2606:2800:220:1:248:1893:25c8:1946"
+                    .parse::<IpAddr>()
+                    .unwrap(),
             ]
         );
     }
@@ -1823,7 +1826,10 @@ mod tests {
 
     #[test]
     fn test_cache_key_matches_gost_format() {
-        assert_eq!(cache_key("example.com.", CLASS_IN, TYPE_A), "example.com.IN.A");
+        assert_eq!(
+            cache_key("example.com.", CLASS_IN, TYPE_A),
+            "example.com.IN.A"
+        );
         assert_eq!(
             cache_key("example.com.", CLASS_IN, TYPE_AAAA),
             "example.com.IN.AAAA"
@@ -2033,7 +2039,10 @@ https://cloudflare-dns.com/dns-query
 
     #[test]
     fn test_parse_signed_go_duration() {
-        assert_eq!(parse_signed_go_duration("30s"), (false, Duration::from_secs(30)));
+        assert_eq!(
+            parse_signed_go_duration("30s"),
+            (false, Duration::from_secs(30))
+        );
         assert_eq!(parse_signed_go_duration("-1s"), (true, Duration::ZERO));
         assert_eq!(parse_signed_go_duration("0"), (false, Duration::ZERO));
         assert_eq!(parse_signed_go_duration("junk"), (false, Duration::ZERO));
@@ -2095,11 +2104,7 @@ https://cloudflare-dns.com/dns-query
     /// counter of the queries it served and the last query it saw.
     async fn spawn_fake_ns(
         ans: FakeAnswer,
-    ) -> (
-        SocketAddr,
-        Arc<AtomicUsize>,
-        Arc<Mutex<Option<Message>>>,
-    ) {
+    ) -> (SocketAddr, Arc<AtomicUsize>, Arc<Mutex<Option<Message>>>) {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         let count = Arc::new(AtomicUsize::new(0));
@@ -2200,7 +2205,10 @@ https://cloudflare-dns.com/dns-query
         assert_eq!(ips, vec!["2001:db8::5".parse::<IpAddr>().unwrap()]);
         // Two SEPARATE queries: A first, then AAAA.
         assert_eq!(count.load(Ordering::SeqCst), 2);
-        assert_eq!(last.lock().unwrap().clone().unwrap().questions[0].qtype, TYPE_AAAA);
+        assert_eq!(
+            last.lock().unwrap().clone().unwrap().questions[0].qtype,
+            TYPE_AAAA
+        );
     }
 
     #[tokio::test]
@@ -2220,7 +2228,10 @@ https://cloudflare-dns.com/dns-query
         assert_eq!(ips, vec!["2001:db8::9".parse::<IpAddr>().unwrap()]);
         // Only the AAAA query was needed.
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        assert_eq!(last.lock().unwrap().clone().unwrap().questions[0].qtype, TYPE_AAAA);
+        assert_eq!(
+            last.lock().unwrap().clone().unwrap().questions[0].qtype,
+            TYPE_AAAA
+        );
     }
 
     #[tokio::test]
@@ -2312,7 +2323,11 @@ https://cloudflare-dns.com/dns-query
         let res = r.resolve("slow.test").await;
         assert!(res.is_err());
         // Two queries (A then AAAA), each capped at 150ms.
-        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
         drop(sock);
     }
 
@@ -2334,7 +2349,11 @@ https://cloudflare-dns.com/dns-query
         let a = r.resolve("cached.test").await.unwrap();
         let b = r.resolve("cached.test").await.unwrap();
         assert_eq!(a, b);
-        assert_eq!(count.load(Ordering::SeqCst), 1, "second lookup must be cached");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "second lookup must be cached"
+        );
         assert_eq!(r.cache_len(), 1);
     }
 
@@ -2356,7 +2375,11 @@ https://cloudflare-dns.com/dns-query
         assert_eq!(count.load(Ordering::SeqCst), 1);
         tokio::time::sleep(Duration::from_millis(250)).await;
         r.resolve("ttl.test").await.unwrap();
-        assert_eq!(count.load(Ordering::SeqCst), 2, "configured TTL must expire");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "configured TTL must expire"
+        );
     }
 
     #[tokio::test]
@@ -2413,15 +2436,22 @@ https://cloudflare-dns.com/dns-query
         r.reload(format!("ttl 60s\nnameserver {}\n", addr).as_bytes())
             .unwrap();
 
-        let q1 = Message::query(0x1111, "wire.test", TYPE_A).encode().unwrap();
+        let q1 = Message::query(0x1111, "wire.test", TYPE_A)
+            .encode()
+            .unwrap();
         let reply = r.exchange(&q1).await.unwrap();
         let mr = Message::decode(&reply).unwrap();
         assert_eq!(mr.id, 0x1111);
-        assert_eq!(mr.answer_ips(), vec!["10.0.0.13".parse::<IpAddr>().unwrap()]);
+        assert_eq!(
+            mr.answer_ips(),
+            vec!["10.0.0.13".parse::<IpAddr>().unwrap()]
+        );
 
         // A second query for the same question with a DIFFERENT id must be
         // served from cache but carry the new id.
-        let q2 = Message::query(0x2222, "wire.test", TYPE_A).encode().unwrap();
+        let q2 = Message::query(0x2222, "wire.test", TYPE_A)
+            .encode()
+            .unwrap();
         let reply2 = r.exchange(&q2).await.unwrap();
         let mr2 = Message::decode(&reply2).unwrap();
         assert_eq!(mr2.id, 0x2222);

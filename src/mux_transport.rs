@@ -111,7 +111,11 @@ impl AsyncRead for MuxStreamConn {
 }
 
 impl AsyncWrite for MuxStreamConn {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
     }
 
@@ -234,7 +238,10 @@ impl Handler for MuxHandler {
 
         let session = Arc::new(MuxSession::server(conn, self.config.clone())?);
         let n = self.sessions.incr();
-        debug!("[{}] {} <-> {} : session up ({} total)", self.tag, peer, local, n);
+        debug!(
+            "[{}] {} <-> {} : session up ({} total)",
+            self.tag, peer, local, n
+        );
 
         loop {
             let stream = tokio::select! {
@@ -328,12 +335,13 @@ impl MuxServer {
         let tracker = TaskTracker::new();
         let sessions = SessionCount::default();
 
-        let pipeline: Arc<dyn Handler> = Arc::new(MuxHandler::new(handler, mux_config).with_lifecycle(
-            "mtls",
-            sessions.clone(),
-            tracker.clone(),
-            cancel.clone(),
-        ));
+        let pipeline: Arc<dyn Handler> =
+            Arc::new(MuxHandler::new(handler, mux_config).with_lifecycle(
+                "mtls",
+                sessions.clone(),
+                tracker.clone(),
+                cancel.clone(),
+            ));
 
         info!("MTLS listening on {}", listener.local_addr()?);
 
@@ -683,7 +691,10 @@ impl std::fmt::Debug for MuxDialer {
         f.debug_struct("MuxDialer")
             .field("label", &self.label)
             .field("sessions_built", &self.sessions_built())
-            .field("live", &self.cached.lock().map(|c| c.is_some()).unwrap_or(false))
+            .field(
+                "live",
+                &self.cached.lock().map(|c| c.is_some()).unwrap_or(false),
+            )
             .finish()
     }
 }
@@ -707,7 +718,9 @@ impl std::fmt::Debug for MuxDialerPool {
             Ok(map) => map.keys().cloned().collect(),
             Err(poisoned) => poisoned.into_inner().keys().cloned().collect(),
         };
-        f.debug_struct("MuxDialerPool").field("nodes", &keys).finish()
+        f.debug_struct("MuxDialerPool")
+            .field("nodes", &keys)
+            .finish()
     }
 }
 
@@ -871,7 +884,9 @@ mod tests {
                     Ok(n) => n,
                 };
                 if buf[..n].starts_with(b"FAIL") {
-                    return Err(HandlerError::Proxy("refused by the test handler".to_string()));
+                    return Err(HandlerError::Proxy(
+                        "refused by the test handler".to_string(),
+                    ));
                 }
                 if conn.write_all(&buf[..n]).await.is_err() {
                     break;
@@ -1083,15 +1098,27 @@ mod tests {
         // /ws default and its 404 for anything else.
         let server = start_mws().await;
         let tcp = TcpStream::connect(server.addr).await.unwrap();
-        let err = match
-            crate::ws::ws_connect_stream(tcp, &server.addr.to_string(), "/", &WsOptions::default())
-                .await
+        let err = match crate::ws::ws_connect_stream(
+            tcp,
+            &server.addr.to_string(),
+            "/",
+            &WsOptions::default(),
+        )
+        .await
         {
             Ok(_) => panic!("the wrong path must not be upgraded"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("404"), "expected a 404, got: {}", err);
-        assert_eq!(server.sessions.get(), 0, "a failed upgrade is not a session");
+        assert!(
+            err.to_string().contains("404"),
+            "expected a 404, got: {}",
+            err
+        );
+        assert_eq!(
+            server.sessions.get(),
+            0,
+            "a failed upgrade is not a session"
+        );
         server.cancel.cancel();
     }
 
@@ -1113,7 +1140,11 @@ mod tests {
         let mut second = dialer.dial().await.unwrap();
         assert_eq!(echo(&mut second, b"two").await, b"two");
 
-        assert_eq!(dialer.sessions_built(), 2, "the dead session must be replaced");
+        assert_eq!(
+            dialer.sessions_built(),
+            2,
+            "the dead session must be replaced"
+        );
         assert_eq!(dials.load(Ordering::Relaxed), 2);
         // Proof the rebuild reached the network rather than being papered over
         // locally: the listener saw a second connection and handshake.
@@ -1151,7 +1182,11 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), 8, "every dial must get a stream of its own");
 
-        assert_eq!(dialer.sessions_built(), 1, "concurrent cold dials built more than one session");
+        assert_eq!(
+            dialer.sessions_built(),
+            1,
+            "concurrent cold dials built more than one session"
+        );
         assert_eq!(dials.load(Ordering::Relaxed), 1);
         assert_eq!(server.sessions.get(), 1);
 
@@ -1259,8 +1294,8 @@ mod tests {
                     async move {
                         let tcp = TcpStream::connect(addr).await?;
                         dials.fetch_add(1, Ordering::Relaxed);
-                        let tls =
-                            crate::tls_transport::tls_connect_stream(tcp, "localhost", true).await?;
+                        let tls = crate::tls_transport::tls_connect_stream(tcp, "localhost", true)
+                            .await?;
                         Ok::<_, BoxError>(tls)
                     }
                 })
@@ -1270,7 +1305,11 @@ mod tests {
         }
 
         assert_eq!(pool.len(), 1);
-        assert_eq!(dials.load(Ordering::Relaxed), 1, "one session for the whole key");
+        assert_eq!(
+            dials.load(Ordering::Relaxed),
+            1,
+            "one session for the whole key"
+        );
         assert_eq!(server.sessions.get(), 1);
 
         pool.remove(&key);
@@ -1365,11 +1404,16 @@ mod tests {
                         .await?,
                     ),
                     _ => {
-                        let tls =
-                            crate::tls_transport::tls_connect_stream(tcp, "localhost", true).await?;
+                        let tls = crate::tls_transport::tls_connect_stream(tcp, "localhost", true)
+                            .await?;
                         Box::new(
-                            crate::ws::ws_connect_stream(tls, "localhost", "", &WsOptions::default())
-                                .await?,
+                            crate::ws::ws_connect_stream(
+                                tls,
+                                "localhost",
+                                "",
+                                &WsOptions::default(),
+                            )
+                            .await?,
                         )
                     }
                 };

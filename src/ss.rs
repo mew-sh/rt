@@ -241,9 +241,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SsStream<S> {
             match Pin::new(&mut self.inner).poll_write(cx, &self.out[self.out_pos..]) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()))
-                }
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
                 Poll::Ready(Ok(n)) => self.out_pos += n,
             }
         }
@@ -426,8 +424,9 @@ impl ShadowConnector {
     /// Fails when the cipher name is unknown, rather than silently falling
     /// back to plaintext under an encrypted-looking configuration.
     pub fn new(method: &str, password: &str) -> Result<Self, HandlerError> {
-        let cipher = SsCipher::from_name(method)
-            .ok_or_else(|| HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method)))?;
+        let cipher = SsCipher::from_name(method).ok_or_else(|| {
+            HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method))
+        })?;
         let key = evp_bytes_to_key(password.as_bytes(), cipher.key_size());
         Ok(Self { cipher, key })
     }
@@ -653,8 +652,9 @@ impl ShadowUdpConnector {
     /// to plaintext under an encrypted-looking configuration -- the same
     /// fail-closed rule the TCP `ShadowConnector` follows.
     pub fn new(method: &str, password: &str) -> Result<Self, HandlerError> {
-        let cipher = SsCipher::from_name(method)
-            .ok_or_else(|| HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method)))?;
+        let cipher = SsCipher::from_name(method).ok_or_else(|| {
+            HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method))
+        })?;
         let key = evp_bytes_to_key(password.as_bytes(), cipher.key_size());
         Ok(Self { cipher, key })
     }
@@ -746,8 +746,9 @@ impl ShadowHandler {
         password: &str,
         options: HandlerOptions,
     ) -> Result<Self, HandlerError> {
-        let cipher = SsCipher::from_name(method)
-            .ok_or_else(|| HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method)))?;
+        let cipher = SsCipher::from_name(method).ok_or_else(|| {
+            HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method))
+        })?;
         let key = evp_bytes_to_key(password.as_bytes(), cipher.key_size());
         Ok(Self {
             cipher,
@@ -840,8 +841,9 @@ impl ShadowUdpHandler {
         password: &str,
         options: HandlerOptions,
     ) -> Result<Self, HandlerError> {
-        let cipher = SsCipher::from_name(method)
-            .ok_or_else(|| HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method)))?;
+        let cipher = SsCipher::from_name(method).ok_or_else(|| {
+            HandlerError::Proxy(format!("unknown shadowsocks cipher: {}", method))
+        })?;
         let key = evp_bytes_to_key(password.as_bytes(), cipher.key_size());
         Ok(Self {
             cipher,
@@ -1170,8 +1172,7 @@ mod tests {
         });
 
         // Start SS handler (plain cipher for testing)
-        let handler =
-            ShadowHandler::new("plain", "testpass", HandlerOptions::default()).unwrap();
+        let handler = ShadowHandler::new("plain", "testpass", HandlerOptions::default()).unwrap();
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
 
@@ -1253,7 +1254,9 @@ mod tests {
     async fn test_aead_roundtrip_spans_multiple_chunks() {
         // Larger than MAX_PAYLOAD, so the writer must split it into several
         // AEAD chunks and the reader must reassemble them.
-        let payload: Vec<u8> = (0..(MAX_PAYLOAD * 3 + 1)).map(|i| (i % 251) as u8).collect();
+        let payload: Vec<u8> = (0..(MAX_PAYLOAD * 3 + 1))
+            .map(|i| (i % 251) as u8)
+            .collect();
         aead_roundtrip("aes-256-gcm", &payload).await;
     }
 
@@ -1331,7 +1334,10 @@ mod tests {
         let a = seal_udp_datagram(&cipher, &key, &plain).unwrap();
         let b = seal_udp_datagram(&cipher, &key, &plain).unwrap();
         assert_ne!(&a[..cipher.key_size()], &b[..cipher.key_size()]);
-        assert_ne!(a, b, "identical plaintext must not produce identical wire bytes");
+        assert_ne!(
+            a, b,
+            "identical plaintext must not produce identical wire bytes"
+        );
     }
 
     #[test]
@@ -1547,8 +1553,8 @@ mod tests {
     async fn test_ssu_handler_relays_to_a_local_echo_server() {
         for method in AEAD_METHODS {
             let echo = spawn_udp_echo().await;
-            let handler = ShadowUdpHandler::new(method, "s3cret", HandlerOptions::default())
-                .unwrap();
+            let handler =
+                ShadowUdpHandler::new(method, "s3cret", HandlerOptions::default()).unwrap();
             let (server_addr, cancel) = spawn_ssu_server(handler).await;
 
             let connector = ShadowUdpConnector::new(method, "s3cret").unwrap();
@@ -1572,7 +1578,11 @@ mod tests {
 
             let (origin, payload) = connector.decode_from(&reply).unwrap();
             assert_eq!(origin, echo.to_string(), "{}: wrong reply origin", method);
-            assert_eq!(payload, b"ping over shadowsocks", "{}: wrong payload", method);
+            assert_eq!(
+                payload, b"ping over shadowsocks",
+                "{}: wrong payload",
+                method
+            );
 
             // The association keeps serving further datagrams.
             let packet = connector.encode_to(&echo.to_string(), b"second").unwrap();
@@ -1641,7 +1651,10 @@ mod tests {
         // Wrong password: the tag check must fail and nothing may be relayed.
         let bad = ShadowUdpConnector::new("aes-256-gcm", "client-pw").unwrap();
         client
-            .send_to(&bad.encode_to(&echo.to_string(), b"leak me").unwrap(), server_addr)
+            .send_to(
+                &bad.encode_to(&echo.to_string(), b"leak me").unwrap(),
+                server_addr,
+            )
             .await
             .unwrap();
         assert!(
@@ -1650,14 +1663,20 @@ mod tests {
         );
 
         // Plain garbage is dropped just as quietly.
-        client.send_to(b"not a shadowsocks datagram", server_addr).await.unwrap();
+        client
+            .send_to(b"not a shadowsocks datagram", server_addr)
+            .await
+            .unwrap();
         assert!(recv_within(&client, 300).await.is_none());
 
         // ...and the association still works for the right password, so a bad
         // datagram does not tear it down.
         let good = ShadowUdpConnector::new("aes-256-gcm", "server-pw").unwrap();
         client
-            .send_to(&good.encode_to(&echo.to_string(), b"ok").unwrap(), server_addr)
+            .send_to(
+                &good.encode_to(&echo.to_string(), b"ok").unwrap(),
+                server_addr,
+            )
             .await
             .unwrap();
         let reply = recv_within(&client, 2_000)
@@ -1692,7 +1711,9 @@ mod tests {
         // Blacklisted destination: dropped.
         client
             .send_to(
-                &connector.encode_to(&blocked.to_string(), b"blocked").unwrap(),
+                &connector
+                    .encode_to(&blocked.to_string(), b"blocked")
+                    .unwrap(),
                 server_addr,
             )
             .await
@@ -1707,7 +1728,9 @@ mod tests {
         // a block does not end the association.
         client
             .send_to(
-                &connector.encode_to(&allowed.to_string(), b"allowed").unwrap(),
+                &connector
+                    .encode_to(&allowed.to_string(), b"allowed")
+                    .unwrap(),
                 server_addr,
             )
             .await
@@ -1821,7 +1844,10 @@ mod tests {
 
         let mut raw = vec![0u8; 4096];
         let n = wire.read(&mut raw).await.unwrap();
-        assert!(!contains(&raw[..n], b"hello"), "the payload must be encrypted");
+        assert!(
+            !contains(&raw[..n], b"hello"),
+            "the payload must be encrypted"
+        );
         let (target, payload) = connector.decode_from(&raw[..n]).unwrap();
         assert_eq!(target, "198.51.100.9:5353");
         assert_eq!(payload, b"hello");

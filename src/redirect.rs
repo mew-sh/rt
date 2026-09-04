@@ -36,8 +36,7 @@ impl TcpRedirectHandler {
 /// destination. Falling back to the local address is not an option -- see
 /// [`TcpRedirectHandler::handle`].
 #[cfg(target_os = "linux")]
-const NO_ORIGINAL_DST: &str =
-    "redirect: no original destination (SO_ORIGINAL_DST unavailable); \
+const NO_ORIGINAL_DST: &str = "redirect: no original destination (SO_ORIGINAL_DST unavailable); \
      is this listener behind an iptables REDIRECT rule?";
 
 #[cfg(not(target_os = "linux"))]

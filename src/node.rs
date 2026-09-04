@@ -474,7 +474,10 @@ mod tests {
         // The `url` crate drops a port that matches the scheme default, which
         // silently turned `http://host:80` into a portless address.
         assert_eq!(Node::parse("http://1.2.3.4:80").unwrap().addr, "1.2.3.4:80");
-        assert_eq!(Node::parse("https://1.2.3.4:443").unwrap().addr, "1.2.3.4:443");
+        assert_eq!(
+            Node::parse("https://1.2.3.4:443").unwrap().addr,
+            "1.2.3.4:443"
+        );
         assert_eq!(Node::parse("ws://1.2.3.4:80").unwrap().addr, "1.2.3.4:80");
     }
 
@@ -516,8 +519,7 @@ mod tests {
 
     #[test]
     fn test_get_duration_matches_go_syntax() {
-        let node =
-            Node::parse("http://h:1?a=1h30m&b=1.5s&c=500ms&d=30&e=100us&f=bogus").unwrap();
+        let node = Node::parse("http://h:1?a=1h30m&b=1.5s&c=500ms&d=30&e=100us&f=bogus").unwrap();
         assert_eq!(node.get_duration("a"), Duration::from_secs(5400));
         assert_eq!(node.get_duration("b"), Duration::from_millis(1500));
         assert_eq!(node.get_duration("c"), Duration::from_millis(500));

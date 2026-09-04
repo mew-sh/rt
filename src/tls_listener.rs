@@ -150,12 +150,11 @@ pub fn server_config_from_pem(
 
     // The provider is named explicitly: several crates in this dependency graph
     // pull in both ring and aws-lc-rs, which leaves no unambiguous default.
-    let config = ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)?;
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
 
     Ok(config)
 }

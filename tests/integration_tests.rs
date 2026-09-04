@@ -259,10 +259,8 @@ async fn integration_socks4a_domain_connect() {
 async fn integration_tcp_direct_forward_echo() {
     let (echo_addr, _echo) = start_echo_server().await;
 
-    let handler = rt::TcpDirectForwardHandler::new(
-        &echo_addr.to_string(),
-        rt::HandlerOptions::default(),
-    );
+    let handler =
+        rt::TcpDirectForwardHandler::new(&echo_addr.to_string(), rt::HandlerOptions::default());
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -284,10 +282,8 @@ async fn integration_tcp_direct_forward_echo() {
 async fn integration_tcp_remote_forward_echo() {
     let (echo_addr, _echo) = start_echo_server().await;
 
-    let handler = rt::TcpRemoteForwardHandler::new(
-        &echo_addr.to_string(),
-        rt::HandlerOptions::default(),
-    );
+    let handler =
+        rt::TcpRemoteForwardHandler::new(&echo_addr.to_string(), rt::HandlerOptions::default());
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -313,8 +309,7 @@ async fn integration_tcp_remote_forward_echo() {
 async fn integration_relay_with_target() {
     let (target_addr, _target) = start_message_server(b"relay-target-ok").await;
 
-    let handler =
-        rt::RelayHandler::new(&target_addr.to_string(), rt::HandlerOptions::default());
+    let handler = rt::RelayHandler::new(&target_addr.to_string(), rt::HandlerOptions::default());
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -629,10 +624,7 @@ async fn integration_server_handles_concurrent_connections() {
 
     #[async_trait::async_trait]
     impl Handler for CounterHandler {
-        async fn handle(
-            &self,
-            mut conn: rt::ProxyConn,
-        ) -> Result<(), rt::handler::HandlerError> {
+        async fn handle(&self, mut conn: rt::ProxyConn) -> Result<(), rt::handler::HandlerError> {
             let mut buf = vec![0u8; 1024];
             let n = conn.read(&mut buf).await?;
             conn.write_all(&buf[..n]).await?;
@@ -819,12 +811,9 @@ async fn integration_chain_tls_hop_fails_against_a_plaintext_proxy() {
     let node = rt::Node::parse(&format!("http+tls://{}", proxy_addr)).unwrap();
     let chain = rt::Chain::new(vec![node]);
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        chain.dial("127.0.0.1:1"),
-    )
-    .await
-    .expect("the TLS hop should fail rather than hang");
+    let result = tokio::time::timeout(Duration::from_secs(10), chain.dial("127.0.0.1:1"))
+        .await
+        .expect("the TLS hop should fail rather than hang");
 
     assert!(
         result.is_err(),
@@ -1098,7 +1087,10 @@ async fn integration_chain_dial_udp_tunnels_through_a_socks5_hop() {
         .dial_udp("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
-    assert!(ch.is_tunnelled(), "a socks5 hop must tunnel UDP, not bypass it");
+    assert!(
+        ch.is_tunnelled(),
+        "a socks5 hop must tunnel UDP, not bypass it"
+    );
 
     ch.send_to(b"hello", &echo_addr.ip().to_string(), echo_addr.port())
         .await
@@ -1172,13 +1164,9 @@ async fn integration_ssu_relays_through_a_socks5_chain() {
     )
     .unwrap();
 
-    let ssu = rt::UdpServer::new(
-        "127.0.0.1:0",
-        rt::UdpListenConfig::default(),
-        handler,
-    )
-    .await
-    .unwrap();
+    let ssu = rt::UdpServer::new("127.0.0.1:0", rt::UdpListenConfig::default(), handler)
+        .await
+        .unwrap();
     let ssu_addr = ssu.local_addr();
     let cancel = ssu.cancel_token();
     tokio::spawn(async move {

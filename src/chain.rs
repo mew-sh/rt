@@ -1042,10 +1042,7 @@ async fn socks5_connect(
     };
     let mut greeting = vec![0x05, methods.len() as u8];
     greeting.extend_from_slice(methods);
-    stream
-        .write_all(&greeting)
-        .await
-        .map_err(ChainError::Io)?;
+    stream.write_all(&greeting).await.map_err(ChainError::Io)?;
 
     let mut buf = [0u8; 2];
     stream.read_exact(&mut buf).await.map_err(ChainError::Io)?;
@@ -1072,7 +1069,10 @@ async fn socks5_connect(
             stream.write_all(&auth).await.map_err(ChainError::Io)?;
 
             let mut reply = [0u8; 2];
-            stream.read_exact(&mut reply).await.map_err(ChainError::Io)?;
+            stream
+                .read_exact(&mut reply)
+                .await
+                .map_err(ChainError::Io)?;
             if reply[1] != 0x00 {
                 return Err(ChainError::ProxyError(
                     "SOCKS5 authentication rejected".into(),
@@ -1318,7 +1318,10 @@ mod tests {
             let handler =
                 crate::http_proxy::HttpHandler::new(crate::handler::HandlerOptions::default());
             let (conn, _) = proxy_listener.accept().await.unwrap();
-            handler.handle(crate::conn::ProxyConn::from_tcp(conn)).await.ok();
+            handler
+                .handle(crate::conn::ProxyConn::from_tcp(conn))
+                .await
+                .ok();
         });
 
         // Create chain with the HTTP proxy
@@ -1352,7 +1355,10 @@ mod tests {
             let handler =
                 crate::socks5::Socks5Handler::new(crate::handler::HandlerOptions::default());
             let (conn, _) = proxy_listener.accept().await.unwrap();
-            handler.handle(crate::conn::ProxyConn::from_tcp(conn)).await.ok();
+            handler
+                .handle(crate::conn::ProxyConn::from_tcp(conn))
+                .await
+                .ok();
         });
 
         // Create chain with the SOCKS5 proxy

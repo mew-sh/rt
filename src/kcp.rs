@@ -321,11 +321,8 @@ impl KcpConfig {
     /// [`KcpConfig::validate`].
     pub fn from_node(node: &Node) -> Result<Self, BoxError> {
         let mut config = match node.get("c") {
-            Some(path) if !path.is_empty() => {
-                KcpConfig::load(&path).map_err(|e| -> BoxError {
-                    format!("kcp: reading {}: {}", path, e).into()
-                })?
-            }
+            Some(path) if !path.is_empty() => KcpConfig::load(&path)
+                .map_err(|e| -> BoxError { format!("kcp: reading {}: {}", path, e).into() })?,
             _ => {
                 let mut config = KcpConfig::default();
                 config.tcp = node.get_bool("tcp");
@@ -341,9 +338,11 @@ impl KcpConfig {
     /// to start instead of quietly behaving differently from the peer.
     pub fn validate(&self) -> Result<(), BoxError> {
         if self.tcp {
-            return Err("kcp: ?tcp=true (tcpraw fake-TCP framing) is not implemented; \
+            return Err(
+                "kcp: ?tcp=true (tcpraw fake-TCP framing) is not implemented; \
                         remove it or use the ftcp:// transport"
-                .into());
+                    .into(),
+            );
         }
         if self.smuxver > 1 {
             return Err(format!(
@@ -439,7 +438,11 @@ const fn crc_table(poly: u32) -> [u32; 256] {
         let mut crc = i as u32;
         let mut bit = 0;
         while bit < 8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ poly } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ poly
+            } else {
+                crc >> 1
+            };
             bit += 1;
         }
         table[i] = crc;
@@ -648,10 +651,12 @@ impl Crypt {
             ))),
             "tea" => CryptKind::Cfb(Box::new(Tea::new(&pass[..16]))),
             "xtea" => CryptKind::Cfb(Box::new(Xtea::new(&pass[..16]))),
-            "aes-128" => CryptKind::Cfb(Box::new(Rc(aes::Aes128::new_from_slice(&pass[..16])
-                .map_err(|e| bad("aes-128", e))?))),
-            "aes-192" => CryptKind::Cfb(Box::new(Rc(aes::Aes192::new_from_slice(&pass[..24])
-                .map_err(|e| bad("aes-192", e))?))),
+            "aes-128" => CryptKind::Cfb(Box::new(Rc(
+                aes::Aes128::new_from_slice(&pass[..16]).map_err(|e| bad("aes-128", e))?
+            ))),
+            "aes-192" => CryptKind::Cfb(Box::new(Rc(
+                aes::Aes192::new_from_slice(&pass[..24]).map_err(|e| bad("aes-192", e))?
+            ))),
             // Big-endian Blowfish, which is Go's `x/crypto/blowfish`; the
             // crate's `BlowfishLE` is a different cipher, and the byte order
             // is a defaulted type parameter that only an annotation pins down.
@@ -663,10 +668,12 @@ impl Crypt {
             "twofish" => CryptKind::Cfb(Box::new(Rc(
                 twofish::Twofish::new_from_slice(&pass).map_err(|e| bad("twofish", e))?
             ))),
-            "cast5" => CryptKind::Cfb(Box::new(Rc(cast5::Cast5::new_from_slice(&pass[..16])
-                .map_err(|e| bad("cast5", e))?))),
-            "3des" => CryptKind::Cfb(Box::new(Rc(des::TdesEde3::new_from_slice(&pass[..24])
-                .map_err(|e| bad("3des", e))?))),
+            "cast5" => CryptKind::Cfb(Box::new(Rc(
+                cast5::Cast5::new_from_slice(&pass[..16]).map_err(|e| bad("cast5", e))?
+            ))),
+            "3des" => CryptKind::Cfb(Box::new(Rc(
+                des::TdesEde3::new_from_slice(&pass[..24]).map_err(|e| bad("3des", e))?
+            ))),
             "aes" | "" => CryptKind::Cfb(Box::new(Rc(
                 aes::Aes256::new_from_slice(&pass).map_err(|e| bad("aes", e))?
             ))),
@@ -909,7 +916,12 @@ struct PacketFramer {
 
 impl PacketFramer {
     fn header_len(&self) -> usize {
-        CRYPT_HEADER_SIZE + if self.fec.is_some() { FEC_HEADER_SIZE_PLUS2 } else { 0 }
+        CRYPT_HEADER_SIZE
+            + if self.fec.is_some() {
+                FEC_HEADER_SIZE_PLUS2
+            } else {
+                0
+            }
     }
 }
 
@@ -1072,7 +1084,11 @@ impl AsyncRead for KcpStream {
 }
 
 impl AsyncWrite for KcpStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
@@ -1435,7 +1451,8 @@ impl<S> SnappyStream<S> {
                 return Ok(progress);
             }
             let kind = self.in_buf[0];
-            let len = u32::from_le_bytes([self.in_buf[1], self.in_buf[2], self.in_buf[3], 0]) as usize;
+            let len =
+                u32::from_le_bytes([self.in_buf[1], self.in_buf[2], self.in_buf[3], 0]) as usize;
             if kind <= 0x01 && len > SNAPPY_MAX_CHUNK {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1589,7 +1606,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SnappyStream<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SnappyStream<S> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
@@ -1700,12 +1721,14 @@ impl KcpListener {
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
         let sessions = SessionCount::default();
-        let pipeline = Arc::new(MuxHandler::new(handler, config.mux_config()?).with_lifecycle(
-            "kcp",
-            sessions.clone(),
-            tracker.clone(),
-            cancel.clone(),
-        ));
+        let pipeline = Arc::new(
+            MuxHandler::new(handler, config.mux_config()?).with_lifecycle(
+                "kcp",
+                sessions.clone(),
+                tracker.clone(),
+                cancel.clone(),
+            ),
+        );
 
         info!("KCP listening on {} (udp)", local);
 
@@ -1908,17 +1931,18 @@ impl KcpTransporter {
         let config = self.config.clone();
         let crypt = self.crypt.clone();
         let counter = self.sessions.clone();
-        self.pool.get_or_create(&addr.clone(), self.mux.clone(), move || {
-            let addr = addr.clone();
-            let config = config.clone();
-            let crypt = crypt.clone();
-            let counter = counter.clone();
-            async move {
-                let stream = kcp_connect(&addr, &config, crypt).await?;
-                counter.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, BoxError>(layer_compression(stream, &config))
-            }
-        })
+        self.pool
+            .get_or_create(&addr.clone(), self.mux.clone(), move || {
+                let addr = addr.clone();
+                let config = config.clone();
+                let crypt = crypt.clone();
+                let counter = counter.clone();
+                async move {
+                    let stream = kcp_connect(&addr, &config, crypt).await?;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, BoxError>(layer_compression(stream, &config))
+                }
+            })
     }
 
     /// Opens a stream on the session for `addr`, building the session first if
@@ -2030,8 +2054,8 @@ pub async fn kcp_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::handler::HandlerError;
+    use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Anything that hangs would block the whole (single-threaded) run, so
@@ -2192,7 +2216,12 @@ mod tests {
     fn test_session_key_matches_kcp_go() {
         // pbkdf2("it's a secrect", "kcp-go", 4096, 32, sha1), from Go.
         let mut pass = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(DEFAULT_KEY.as_bytes(), KCP_SALT.as_bytes(), 4096, &mut pass);
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(
+            DEFAULT_KEY.as_bytes(),
+            KCP_SALT.as_bytes(),
+            4096,
+            &mut pass,
+        );
         assert_eq!(
             hex(&pass),
             "25d7d7bd51050742d8d791f2b653c6c8b2366b7e25a124cf7a2e12eaf4ffa444"
@@ -2261,7 +2290,10 @@ mod tests {
         let segments = sample(IKCP_OVERHEAD + 17);
         framer.write_all(&segments).unwrap();
         let mut pkt = queue.lock().unwrap().pop_front().unwrap();
-        assert_eq!(pkt.len(), CRYPT_HEADER_SIZE + FEC_HEADER_SIZE_PLUS2 + segments.len());
+        assert_eq!(
+            pkt.len(),
+            CRYPT_HEADER_SIZE + FEC_HEADER_SIZE_PLUS2 + segments.len()
+        );
 
         let range = packet_unframe(&crypt, &mut pkt).expect("the packet must verify");
         assert_eq!(&pkt[range], &segments[..]);
@@ -2813,7 +2845,10 @@ mod tests {
 
     async fn wait_for_tcp(port: u16) {
         for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

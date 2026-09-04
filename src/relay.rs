@@ -365,8 +365,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RelayConn<S> {
 
         me.queue_pending_header();
         if me.udp {
-            me.out
-                .extend_from_slice(&(buf.len() as u16).to_be_bytes());
+            me.out.extend_from_slice(&(buf.len() as u16).to_be_bytes());
         }
         me.out.extend_from_slice(buf);
 
@@ -871,7 +870,10 @@ mod tests {
 
         let connector = RelayConnector::new(None);
         let stream = TcpStream::connect(server_addr).await.unwrap();
-        let _ = connector.connect(stream, "udp", "1.2.3.4:80").await.unwrap();
+        let _ = connector
+            .connect(stream, "udp", "1.2.3.4:80")
+            .await
+            .unwrap();
 
         let (head, features) = reader.await.unwrap();
 
@@ -885,7 +887,10 @@ mod tests {
         expected.extend_from_slice(&expected_data);
 
         assert_eq!(features, expected);
-        assert_eq!(u16::from_be_bytes([head[2], head[3]]) as usize, expected.len());
+        assert_eq!(
+            u16::from_be_bytes([head[2], head[3]]) as usize,
+            expected.len()
+        );
     }
 
     #[tokio::test]
@@ -1077,7 +1082,12 @@ mod tests {
                 .await
                 .unwrap();
             // Split even the length prefix, so poll_fill has to resume.
-            for chunk in [&[0x02u8][..], &[0x58u8][..], &expected[..100], &expected[100..]] {
+            for chunk in [
+                &[0x02u8][..],
+                &[0x58u8][..],
+                &expected[..100],
+                &expected[100..],
+            ] {
                 wire.write_all(chunk).await.unwrap();
                 wire.flush().await.unwrap();
                 tokio::time::sleep(Duration::from_millis(5)).await;

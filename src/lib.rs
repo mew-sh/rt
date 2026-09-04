@@ -12,8 +12,8 @@ pub mod auth;
 pub mod bypass;
 pub mod chain;
 pub mod client;
-pub mod conn;
 pub mod config;
+pub mod conn;
 pub mod dns_proxy;
 pub mod forward;
 pub mod ftcp;
@@ -53,8 +53,8 @@ pub mod ws;
 pub use auth::{Authenticator, LocalAuthenticator};
 pub use bypass::{Bypass, CidrMatcher, DomainMatcher, IpMatcher, Matcher};
 pub use chain::{Chain, ChainOptions};
-pub use conn::{AsyncStream, ProxyConn};
 pub use client::{Client, ConnectOptions, Connector, DialOptions, HandshakeOptions, Transporter};
+pub use conn::{AsyncStream, ProxyConn};
 pub use dns_proxy::{DnsHandler, DnsUdpProxy};
 pub use forward::{TcpDirectForwardHandler, UdpDirectForwardHandler};
 pub use ftcp::{FakeTcpListenConfig, FakeTcpListener, FakeTcpTransporter};
@@ -62,7 +62,9 @@ pub use handler::{Handler, HandlerOptions};
 pub use hosts::{Host, Hosts};
 pub use http2_transport::{Http2Connector, Http2Handler, Http2Transporter};
 pub use http_proxy::{HttpConnector, HttpHandler};
-pub use kcp::{kcp_connect, Crypt, KcpConfig, KcpListener, KcpStream, KcpTransporter, SnappyStream};
+pub use kcp::{
+    kcp_connect, Crypt, KcpConfig, KcpListener, KcpStream, KcpTransporter, SnappyStream,
+};
 pub use mux::{MuxFrame, MuxSession};
 pub use mux_transport::{
     mux_config_from_node, mux_config_from_values, MuxDialer, MuxDialerPool, MuxHandler, MuxServer,
@@ -72,9 +74,9 @@ pub use node::{Node, NodeGroup, ParseNodeError};
 pub use obfs::{Obfs4Transporter, ObfsHttpTransporter, ObfsTlsTransporter};
 pub use permissions::{Can, Permissions, PortRange};
 pub use quic_transport::{
-    alpn_protocols, key_from_cipher, negotiated_alpn, quic_config_from_node,
-    quic_transport_config, ConnectionCount, QuicConfig, QuicDialer, QuicListener, QuicServer,
-    QuicStream, QuicTransporter, QUIC_ALPN,
+    alpn_protocols, key_from_cipher, negotiated_alpn, quic_config_from_node, quic_transport_config,
+    ConnectionCount, QuicConfig, QuicDialer, QuicListener, QuicServer, QuicStream, QuicTransporter,
+    QUIC_ALPN,
 };
 pub use redirect::TcpRedirectHandler;
 pub use relay::{RelayConn, RelayConnector, RelayHandler};
@@ -92,11 +94,11 @@ pub use ss::{
 pub use ssh::{SshConfig, SshForwardHandler, SshTunnelTransporter};
 pub use tls_listener::TlsServer;
 pub use tuntap::{IpRoute, TapConfig, TapHandler, TunConfig, TunHandler};
-pub use vsock_transport::{VsockAddr, VsockListener, VsockTransporter};
 pub use udp::{UdpListenConfig, UdpListener, UdpServer, UdpServerConn};
+pub use vsock_transport::{VsockAddr, VsockListener, VsockTransporter};
 pub use ws::{ws_connect_stream, WsOptions, WsServer, WsStream, DEFAULT_WS_PATH};
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "2.0.0";
 pub const SMALL_BUFFER_SIZE: usize = 2 * 1024;
 pub const MEDIUM_BUFFER_SIZE: usize = 8 * 1024;
 pub const LARGE_BUFFER_SIZE: usize = 32 * 1024;
@@ -107,4 +109,4 @@ pub const CONNECT_TIMEOUT: u64 = 5;
 pub const READ_TIMEOUT: u64 = 10;
 pub const WRITE_TIMEOUT: u64 = 10;
 pub const DEFAULT_USER_AGENT: &str = "Chrome/78.0.3904.106";
-pub const DEFAULT_PROXY_AGENT: &str = "rt/0.1.0";
+pub const DEFAULT_PROXY_AGENT: &str = "rt/2.0.0";

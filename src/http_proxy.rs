@@ -789,7 +789,9 @@ mod tests {
         let mut kvs = std::collections::HashMap::new();
         kvs.insert("u".to_string(), "p".to_string());
         HandlerOptions {
-            authenticator: Some(std::sync::Arc::new(crate::auth::LocalAuthenticator::new(kvs))),
+            authenticator: Some(std::sync::Arc::new(crate::auth::LocalAuthenticator::new(
+                kvs,
+            ))),
             probe_resist: probe_resist.to_string(),
             knocking_host: knock.to_string(),
             ..Default::default()
@@ -807,10 +809,13 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let req = format!("CONNECT {} HTTP/1.1
+        let req = format!(
+            "CONNECT {} HTTP/1.1
 Host: {}
 
-", host, host);
+",
+            host, host
+        );
         client.write_all(req.as_bytes()).await.unwrap();
 
         let mut buf = Vec::new();
@@ -870,7 +875,9 @@ Host: {}
     async fn test_probe_resist_file_serves_a_decoy_page() {
         let dir = std::env::temp_dir();
         let path = dir.join("rt_probe_resist_decoy.html");
-        tokio::fs::write(&path, b"<html>decoy</html>").await.unwrap();
+        tokio::fs::write(&path, b"<html>decoy</html>")
+            .await
+            .unwrap();
 
         let spec = format!("file:{}", path.display());
         let resp = probe(auth_opts(&spec, ""), "example.com:443").await;
@@ -893,7 +900,11 @@ Host: {}
     #[tokio::test]
     async fn test_knocking_host_bypasses_probe_resistance() {
         // An operator naming the knock host must still get the real 407.
-        let resp = probe(auth_opts("code:404", "secret.example"), "secret.example:443").await;
+        let resp = probe(
+            auth_opts("code:404", "secret.example"),
+            "secret.example:443",
+        )
+        .await;
         assert!(resp.starts_with("HTTP/1.1 407"), "got: {:?}", resp);
         assert!(resp.contains("Proxy-Authenticate"));
     }
@@ -908,7 +919,11 @@ Host: {}
             let mut buf = vec![0u8; 1024];
             let n = c.read(&mut buf).await.unwrap();
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            assert!(req.starts_with("GET /"), "decoy fetch should be a GET: {:?}", req);
+            assert!(
+                req.starts_with("GET /"),
+                "decoy fetch should be a GET: {:?}",
+                req
+            );
             c.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n<h1>decoy</h1>",
             )
@@ -949,12 +964,14 @@ Host: {}
             let n = c.read(&mut buf).await.unwrap();
             // The proxy credentials must not be replayed to the decoy.
             assert!(!String::from_utf8_lossy(&buf[..n]).contains("Proxy-"));
-            c.write_all(b"HTTP/1.1 200 OK
+            c.write_all(
+                b"HTTP/1.1 200 OK
 Content-Length: 5
 
-hello")
-                .await
-                .unwrap();
+hello",
+            )
+            .await
+            .unwrap();
         });
 
         let spec = format!("host:{}", decoy_addr);
@@ -1016,7 +1033,11 @@ hello")
             .expect("origin server did not receive the body")
             .unwrap();
 
-        assert!(got.contains("BODY-HERE"), "request body was dropped: {:?}", got);
+        assert!(
+            got.contains("BODY-HERE"),
+            "request body was dropped: {:?}",
+            got
+        );
         assert!(
             got.starts_with("POST /submit HTTP/1.1"),
             "expected origin-form request line, got: {:?}",

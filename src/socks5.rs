@@ -646,7 +646,13 @@ impl Socks5Handler {
             match chain.dial_with_options(target, &opts).await {
                 Ok(cc) => return Ok(cc),
                 Err(e) => {
-                    debug!("[socks5] dial {} attempt {}/{}: {}", target, i + 1, retries, e);
+                    debug!(
+                        "[socks5] dial {} attempt {}/{}: {}",
+                        target,
+                        i + 1,
+                        retries,
+                        e
+                    );
                     last_err = e;
                 }
             }
@@ -675,7 +681,10 @@ impl Socks5Handler {
             self.options.whitelist.as_ref(),
             self.options.blacklist.as_ref(),
         ) {
-            warn!("[socks5] {} - unauthorized to tcp connect to {}", peer_addr, target);
+            warn!(
+                "[socks5] {} - unauthorized to tcp connect to {}",
+                peer_addr, target
+            );
             send_reply(&mut conn, REP_NOT_ALLOWED, "0.0.0.0", 0).await?;
             return Err(HandlerError::Forbidden);
         }
@@ -724,7 +733,10 @@ impl Socks5Handler {
                 self.options.whitelist.as_ref(),
                 self.options.blacklist.as_ref(),
             ) {
-                warn!("[socks5-bind] {} - unauthorized to tcp bind to {}", peer_addr, target);
+                warn!(
+                    "[socks5-bind] {} - unauthorized to tcp bind to {}",
+                    peer_addr, target
+                );
                 send_reply(&mut conn, REP_NOT_ALLOWED, "0.0.0.0", 0).await?;
                 return Err(HandlerError::Forbidden);
             }
@@ -780,7 +792,10 @@ impl Socks5Handler {
             self.options.whitelist.as_ref(),
             self.options.blacklist.as_ref(),
         ) {
-            warn!("[socks5-udp] {} - unauthorized to udp connect to {}", peer_addr, target);
+            warn!(
+                "[socks5-udp] {} - unauthorized to udp connect to {}",
+                peer_addr, target
+            );
             send_reply(&mut conn, REP_NOT_ALLOWED, "0.0.0.0", 0).await?;
             return Err(HandlerError::Forbidden);
         }
@@ -965,7 +980,10 @@ impl Socks5Handler {
             debug!("[socks5-udp-tun] {} - relay: {}", peer_addr, e);
         }
 
-        info!("[socks5-udp-tun] {} >-< {} : tunnel closed", peer_addr, target);
+        info!(
+            "[socks5-udp-tun] {} >-< {} : tunnel closed",
+            peer_addr, target
+        );
         Ok(())
     }
 
@@ -1246,11 +1264,7 @@ impl Handler for Socks5Handler {
 /// Binds a real TCP listener, sends a first reply carrying the bound address,
 /// and on the first inbound peer connection sends a second reply carrying the
 /// peer's address before splicing the two connections together.
-async fn bind_on(
-    mut conn: ProxyConn,
-    addr: &str,
-    peer_addr: &str,
-) -> Result<(), HandlerError> {
+async fn bind_on(mut conn: ProxyConn, addr: &str, peer_addr: &str) -> Result<(), HandlerError> {
     // Strict mode, like gost: if the port is already in use, fail.
     let ln = match TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -1318,7 +1332,10 @@ async fn bind_on(
             Err(HandlerError::Io(e))
         }
         Ev::Closed => {
-            debug!("[socks5-bind] {} - control connection closed while binding", peer_addr);
+            debug!(
+                "[socks5-bind] {} - control connection closed while binding",
+                peer_addr
+            );
             Ok(())
         }
     }
@@ -1461,12 +1478,7 @@ async fn resolve_udp_addr(host: &str, port: u16) -> Option<SocketAddr> {
 
 /// Generic over the stream so the same reply writer serves a `ProxyConn`
 /// control connection and a plain `TcpStream`.
-async fn send_reply<S>(
-    conn: &mut S,
-    rep: u8,
-    addr: &str,
-    port: u16,
-) -> Result<(), HandlerError>
+async fn send_reply<S>(conn: &mut S, rep: u8, addr: &str, port: u16) -> Result<(), HandlerError>
 where
     S: AsyncWrite + Unpin + Send + ?Sized,
 {
@@ -1967,13 +1979,11 @@ mod tests {
         udp.send_to(&dgram, relay_addr).await.unwrap();
 
         let mut buf = vec![0u8; 2048];
-        let (n, from) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            udp.recv_from(&mut buf),
-        )
-        .await
-        .expect("timed out waiting for the relayed UDP reply")
-        .unwrap();
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), udp.recv_from(&mut buf))
+                .await
+                .expect("timed out waiting for the relayed UDP reply")
+                .unwrap();
         assert_eq!(from, relay_addr);
 
         let (frag, rhost, rport, off) = parse_udp_datagram(&buf[..n]).unwrap();
@@ -2025,7 +2035,10 @@ mod tests {
             udp.recv_from(&mut buf),
         )
         .await;
-        assert!(r.is_err(), "fragmented datagrams must be dropped, not relayed");
+        assert!(
+            r.is_err(),
+            "fragmented datagrams must be dropped, not relayed"
+        );
     }
 
     #[tokio::test]
@@ -2060,7 +2073,8 @@ mod tests {
         let proxy_addr = spawn_proxy(HandlerOptions {
             blacklist: Some(bl),
             ..Default::default()
-        }).await;
+        })
+        .await;
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         greet(&mut client).await;
@@ -2087,7 +2101,10 @@ mod tests {
         // First reply: the bound address.
         let (rep, host, port) = read_reply(&mut client).await;
         assert_eq!(rep, REP_SUCCESS);
-        assert_ne!(port, 0, "the first BIND reply must carry the real bound port");
+        assert_ne!(
+            port, 0,
+            "the first BIND reply must carry the real bound port"
+        );
         let bound: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
 
         // A peer connects to the bound address.
@@ -2117,7 +2134,8 @@ mod tests {
         let proxy_addr = spawn_proxy(HandlerOptions {
             blacklist: Some(bl),
             ..Default::default()
-        }).await;
+        })
+        .await;
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         greet(&mut client).await;
@@ -2180,10 +2198,8 @@ mod tests {
 
         // The ASSOCIATE request itself (0.0.0.0:0) is not covered by the rule,
         // so the association is granted and only the datagram is filtered.
-        let bypass = std::sync::Arc::new(crate::bypass::Bypass::from_patterns(
-            false,
-            &["127.0.0.1"],
-        ));
+        let bypass =
+            std::sync::Arc::new(crate::bypass::Bypass::from_patterns(false, &["127.0.0.1"]));
         let proxy_addr = spawn_proxy(HandlerOptions {
             bypass: Some(bypass),
             ..Default::default()
@@ -2271,14 +2287,11 @@ mod tests {
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         udp.send_to(&dgram, relay_addr).await.unwrap();
         let mut buf = vec![0u8; 2048];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            udp.recv_from(&mut buf),
-        )
-        .await
-        .expect("control: the datagram addressed by domain must be relayed")
-        .unwrap()
-        .0;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), udp.recv_from(&mut buf))
+            .await
+            .expect("control: the datagram addressed by domain must be relayed")
+            .unwrap()
+            .0;
         let (_, _, _, off) = parse_udp_datagram(&buf[..n]).unwrap();
         assert_eq!(&buf[off..n], b"echo:ping");
 
@@ -2379,7 +2392,8 @@ mod tests {
             retries: 3,
             timeout: std::time::Duration::from_millis(100),
             ..Default::default()
-        }).await;
+        })
+        .await;
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         greet(&mut client).await;
@@ -2418,7 +2432,10 @@ mod tests {
             ..Default::default()
         })
         .dial_setup();
-        assert_eq!(r, 5, "the chain's Retries must be used when the handler's is 0");
+        assert_eq!(
+            r, 5,
+            "the chain's Retries must be used when the handler's is 0"
+        );
         assert_eq!(c.retries, 1, "the inner chain loop must not retry as well");
 
         // Handler wins over chain (gost socks.go:915-921).
@@ -2563,7 +2580,7 @@ mod tests {
                 0x00, 0x05, // RSV = 5 = len("hello"), big-endian
                 0x00, // FRAG
                 0x01, // ATYP = IPv4
-                1, 2, 3, 4,    // DST.ADDR
+                1, 2, 3, 4, // DST.ADDR
                 0x16, 0x2E, // DST.PORT = 5678
                 b'h', b'e', b'l', b'l', b'o',
             ]
@@ -2620,9 +2637,15 @@ mod tests {
         let mut conn = Socks5UdpTunnelConn::server(b);
 
         let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
-        assert_eq!((d.as_slice(), h.as_str(), p), (&b"ping"[..], "127.0.0.1", 53));
+        assert_eq!(
+            (d.as_slice(), h.as_str(), p),
+            (&b"ping"[..], "127.0.0.1", 53)
+        );
         let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
-        assert_eq!((d.as_slice(), h.as_str(), p), (&b"ok"[..], "example.com", 443));
+        assert_eq!(
+            (d.as_slice(), h.as_str(), p),
+            (&b"ok"[..], "example.com", 443)
+        );
         let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
         assert_eq!((d.as_slice(), h.as_str(), p), (&b"z"[..], "::1", 8080));
     }
@@ -2671,11 +2694,17 @@ mod tests {
 
         let mut conn = Socks5UdpTunnelConn::server(b);
         let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
-        assert_eq!(d, payload, "a datagram split over many reads must arrive whole");
+        assert_eq!(
+            d, payload,
+            "a datagram split over many reads must arrive whole"
+        );
         assert_eq!((h.as_str(), p), ("1.2.3.4", 9999));
 
         let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
-        assert_eq!(d, b"tail", "the next datagram must not absorb the previous one");
+        assert_eq!(
+            d, b"tail",
+            "the next datagram must not absorb the previous one"
+        );
         assert_eq!((h.as_str(), p), ("example.com", 53));
     }
 
@@ -2925,12 +2954,10 @@ mod tests {
         frame.extend_from_slice(b"ping");
         client.write_all(&frame).await.unwrap();
 
-        let (data, rhost, rport) = tokio::time::timeout(
-            Duration::from_secs(5),
-            read_tunnel_frame(&mut client),
-        )
-        .await
-        .expect("timed out waiting for the tunnelled reply");
+        let (data, rhost, rport) =
+            tokio::time::timeout(Duration::from_secs(5), read_tunnel_frame(&mut client))
+                .await
+                .expect("timed out waiting for the tunnelled reply");
         assert_eq!(data, b"echo:ping");
         assert_eq!(rhost, echo_addr.ip().to_string());
         assert_eq!(rport, echo_addr.port());
@@ -2956,12 +2983,11 @@ mod tests {
             .await
             .unwrap();
 
-        let (data, host, port) =
-            tokio::time::timeout(Duration::from_secs(5), tunnel.recv_from())
-                .await
-                .expect("timed out waiting for the tunnelled reply")
-                .unwrap()
-                .unwrap();
+        let (data, host, port) = tokio::time::timeout(Duration::from_secs(5), tunnel.recv_from())
+            .await
+            .expect("timed out waiting for the tunnelled reply")
+            .unwrap()
+            .unwrap();
         assert_eq!(data, b"echo:ping");
         assert_eq!(host, echo_addr.ip().to_string());
         assert_eq!(port, echo_addr.port());
@@ -2992,12 +3018,10 @@ mod tests {
 
         let mut seen = Vec::new();
         for _ in 0..2 {
-            let (data, _, _) = tokio::time::timeout(
-                Duration::from_secs(5),
-                read_tunnel_frame(&mut client),
-            )
-            .await
-            .expect("timed out waiting for a tunnelled reply");
+            let (data, _, _) =
+                tokio::time::timeout(Duration::from_secs(5), read_tunnel_frame(&mut client))
+                    .await
+                    .expect("timed out waiting for a tunnelled reply");
             seen.push(String::from_utf8(data).unwrap());
         }
         seen.sort();
@@ -3074,10 +3098,8 @@ mod tests {
             "control: an unfiltered datagram must be relayed through the tunnel"
         );
 
-        let bypass = std::sync::Arc::new(crate::bypass::Bypass::from_patterns(
-            false,
-            &["127.0.0.1"],
-        ));
+        let bypass =
+            std::sync::Arc::new(crate::bypass::Bypass::from_patterns(false, &["127.0.0.1"]));
         assert!(
             !tunnel_datagram_relayed(
                 HandlerOptions {

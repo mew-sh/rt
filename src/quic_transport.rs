@@ -601,7 +601,11 @@ impl AsyncRead for QuicStream {
 }
 
 impl AsyncWrite for QuicStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         AsyncWrite::poll_write(Pin::new(&mut self.get_mut().send), cx, buf)
     }
 
@@ -1004,8 +1008,7 @@ impl QuicDialer {
             "[quic] {}: connection {} up (alpn {:?})",
             self.addr,
             self.built.load(Ordering::Relaxed),
-            negotiated_alpn(&session.connection)
-                .map(|p| String::from_utf8_lossy(&p).into_owned())
+            negotiated_alpn(&session.connection).map(|p| String::from_utf8_lossy(&p).into_owned())
         );
 
         let connection = session.connection.clone();
@@ -1115,15 +1118,13 @@ fn insecure_client_config() -> Result<rustls::ClientConfig, BoxError> {
     // The provider is named explicitly: several crates in this dependency
     // graph pull in both ring and aws-lc-rs, which leaves no unambiguous
     // default. Same reasoning as `tls_listener::server_config_from_pem`.
-    Ok(
-        rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth(),
-    )
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+    .with_no_client_auth())
 }
 
 /// The host part of `host:port`, for the default SNI name.
@@ -1558,7 +1559,10 @@ mod tests {
     fn test_alpn_is_gosts_list_in_gosts_order() {
         // tlsConfigQUICALPN, quic.go:345.
         assert_eq!(QUIC_ALPN, [b"http/3".as_slice(), b"quic/v1".as_slice()]);
-        assert_eq!(alpn_protocols(), vec![b"http/3".to_vec(), b"quic/v1".to_vec()]);
+        assert_eq!(
+            alpn_protocols(),
+            vec![b"http/3".to_vec(), b"quic/v1".to_vec()]
+        );
     }
 
     #[tokio::test]
@@ -1789,8 +1793,8 @@ mod tests {
 
     #[test]
     fn test_the_node_parameters_reach_the_config() {
-        let node = Node::parse("quic://127.0.0.1:1080?keepalive=true&ttl=15&timeout=3&idle=45")
-            .unwrap();
+        let node =
+            Node::parse("quic://127.0.0.1:1080?keepalive=true&ttl=15&timeout=3&idle=45").unwrap();
         let config = quic_config_from_node(&node).unwrap();
         assert!(config.keep_alive);
         assert_eq!(config.keep_alive_period, Duration::from_secs(15));

@@ -4,9 +4,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::auth::Authenticator;
-use crate::conn::ProxyConn;
 use crate::bypass::Bypass;
 use crate::chain::Chain;
+use crate::conn::ProxyConn;
 use crate::node::Node;
 use crate::permissions::Permissions;
 

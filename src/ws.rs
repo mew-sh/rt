@@ -166,7 +166,9 @@ fn ws_config(options: &WsOptions) -> WebSocketConfig {
 /// dropped silently.
 fn warn_unsupported(options: &WsOptions) {
     if options.enable_compression {
-        warn!("[ws] compression requested but ignored: tungstenite has no permessage-deflate support");
+        warn!(
+            "[ws] compression requested but ignored: tungstenite has no permessage-deflate support"
+        );
     }
     if options.read_buffer_size != 0 {
         warn!("[ws] read_buffer_size requested but ignored: tungstenite has no read buffer size option");
@@ -356,9 +358,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             // Closing an already-closed connection is a no-op, not a failure.
-            Poll::Ready(Err(WsError::ConnectionClosed)) | Poll::Ready(Err(WsError::AlreadyClosed)) => {
-                Poll::Ready(Ok(()))
-            }
+            Poll::Ready(Err(WsError::ConnectionClosed))
+            | Poll::Ready(Err(WsError::AlreadyClosed)) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(ws_to_io(e))),
         }
     }
@@ -1087,7 +1088,9 @@ mod tests {
         let (a, b) = tokio::io::duplex(64 * 1024);
 
         let served = tokio::spawn(async move {
-            handler.handle(ProxyConn::new(Box::new(b), None, None)).await
+            handler
+                .handle(ProxyConn::new(Box::new(b), None, None))
+                .await
         });
 
         let mut ws = ws_connect_stream(a, "example.com", "", &WsOptions::default())

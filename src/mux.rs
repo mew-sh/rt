@@ -655,8 +655,13 @@ impl SessionShared {
         }
         tracing::debug!("smux session closed: {}", err);
         self.queue.close();
-        let streams: Vec<Arc<StreamShared>> =
-            self.streams.lock().unwrap().drain().map(|(_, s)| s).collect();
+        let streams: Vec<Arc<StreamShared>> = self
+            .streams
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
         for s in streams {
             s.set_dead();
         }
@@ -880,8 +885,11 @@ impl std::fmt::Debug for MuxSession {
 // Background tasks
 // ---------------------------------------------------------------------------
 
-async fn reader_task<R>(mut reader: R, shared: Arc<SessionShared>, accept_tx: mpsc::Sender<MuxStream>)
-where
+async fn reader_task<R>(
+    mut reader: R,
+    shared: Arc<SessionShared>,
+    accept_tx: mpsc::Sender<MuxStream>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let mut header = [0u8; HEADER_SIZE];
@@ -1131,10 +1139,10 @@ impl MuxStream {
         self.fin_sent = true;
         // FIN goes on the data queue so it keeps its place behind this
         // stream's pending PSH frames rather than overtaking them.
-        if let Ok(seq) = self
-            .session
-            .queue
-            .force_push_data(MuxFrame::new(self.version, CMD_FIN, self.id))
+        if let Ok(seq) =
+            self.session
+                .queue
+                .force_push_data(MuxFrame::new(self.version, CMD_FIN, self.id))
         {
             self.last_push = seq;
         }
@@ -1338,9 +1346,7 @@ mod tests {
         let frame = MuxFrame::with_data(VERSION_1, CMD_PSH, 0x0102_0304, b"hello".to_vec());
         assert_eq!(
             frame.encode().unwrap(),
-            vec![
-                0x01, 0x02, 0x05, 0x00, 0x04, 0x03, 0x02, 0x01, b'h', b'e', b'l', b'l', b'o',
-            ]
+            vec![0x01, 0x02, 0x05, 0x00, 0x04, 0x03, 0x02, 0x01, b'h', b'e', b'l', b'l', b'o',]
         );
     }
 
@@ -1349,7 +1355,10 @@ mod tests {
         // 0x0102 = 258 bytes of payload. Big-endian would put 0x01 first.
         let frame = MuxFrame::with_data(VERSION_1, CMD_PSH, 0xAABB_CCDD, vec![0x5A; 0x0102]);
         let bytes = frame.encode().unwrap();
-        assert_eq!(&bytes[..HEADER_SIZE], &[0x01, 0x02, 0x02, 0x01, 0xDD, 0xCC, 0xBB, 0xAA]);
+        assert_eq!(
+            &bytes[..HEADER_SIZE],
+            &[0x01, 0x02, 0x02, 0x01, 0xDD, 0xCC, 0xBB, 0xAA]
+        );
         assert_eq!(bytes.len(), HEADER_SIZE + 0x0102);
     }
 
@@ -1542,7 +1551,10 @@ mod tests {
         let b = server.open_stream().await.unwrap();
         assert_eq!(a.id(), 2);
         assert_eq!(b.id(), 4);
-        assert!(a.id() % 2 == 0 && b.id() % 2 == 0, "server ids must be even");
+        assert!(
+            a.id() % 2 == 0 && b.id() % 2 == 0,
+            "server ids must be even"
+        );
 
         let f1 = read_frame(&mut wire).await;
         assert_eq!((f1.cmd, f1.sid), (CMD_SYN, 2));
@@ -1752,7 +1764,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
-        assert!(client.is_closed(), "session must fail after keepalive timeout");
+        assert!(
+            client.is_closed(),
+            "session must fail after keepalive timeout"
+        );
         assert_eq!(
             client.error().unwrap().kind(),
             io::ErrorKind::TimedOut,
@@ -1778,7 +1793,10 @@ mod tests {
 
         // Both ends ping each other, so data_ready keeps getting set.
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert!(!client.is_closed(), "keepalive traffic must keep the session alive");
+        assert!(
+            !client.is_closed(),
+            "keepalive traffic must keep the session alive"
+        );
         assert!(!server.is_closed());
     }
 
@@ -1807,7 +1825,10 @@ mod tests {
         // The transport dies with the client, so the server's reader task
         // errors out and the accept channel closes.
         let got = tokio::time::timeout(Duration::from_secs(2), server.accept_stream()).await;
-        assert!(matches!(got, Ok(None)), "accept must terminate, got {got:?}");
+        assert!(
+            matches!(got, Ok(None)),
+            "accept must terminate, got {got:?}"
+        );
     }
 
     #[tokio::test]
@@ -1914,10 +1935,8 @@ mod tests {
             got,
             vec![
                 // SYN sid=3
-                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
-                // PSH sid=3 len=2 "hi"
-                0x01, 0x02, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, b'h', b'i',
-                // FIN sid=3
+                0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, // PSH sid=3 len=2 "hi"
+                0x01, 0x02, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, b'h', b'i', // FIN sid=3
                 0x01, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
             ]
         );

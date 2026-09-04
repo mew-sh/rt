@@ -76,11 +76,7 @@ impl FilterSelector {
 
     /// The selector gost installs for a forward/chain node group: drop nodes
     /// with invalid ports, then nodes that have failed too recently.
-    pub fn with_fail_filter(
-        strategy: &str,
-        max_fails: u32,
-        fail_timeout: Duration,
-    ) -> Self {
+    pub fn with_fail_filter(strategy: &str, max_fails: u32, fail_timeout: Duration) -> Self {
         Self::with_filters(strategy, max_fails, fail_timeout, 0)
     }
 
@@ -606,7 +602,10 @@ mod tests {
         nodes[1].reset_dead();
         let picked: std::collections::HashSet<String> =
             (0..6).map(|_| sel.select(&nodes).unwrap().addr).collect();
-        assert!(picked.contains("dead:2"), "recovered node should return to rotation");
+        assert!(
+            picked.contains("dead:2"),
+            "recovered node should return to rotation"
+        );
     }
 
     #[test]

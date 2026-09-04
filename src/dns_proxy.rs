@@ -217,7 +217,12 @@ pub enum DohRequest {
 /// * `POST` requires `Content-Type: application/dns-message` -- otherwise 415.
 /// * Any other method is 405.
 /// * A body that is not a decodable DNS message is 400.
-pub fn parse_doh_request(method: &str, target: &str, content_type: Option<&str>, body: &[u8]) -> DohRequest {
+pub fn parse_doh_request(
+    method: &str,
+    target: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> DohRequest {
     let buf: Vec<u8> = match method {
         "GET" => {
             let dns_param = query_param(target, "dns").unwrap_or_default();
@@ -834,7 +839,10 @@ mod tests {
 
         let mr = Message::decode(&buf[..n]).unwrap();
         assert_eq!(mr.id, 0x4242);
-        assert_eq!(mr.answer_ips(), vec!["10.1.2.3".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(
+            mr.answer_ips(),
+            vec!["10.1.2.3".parse::<std::net::IpAddr>().unwrap()]
+        );
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
@@ -898,7 +906,9 @@ mod tests {
 
         let mut s = TcpStream::connect(addr).await.unwrap();
         let query = Message::query(0x0101, "tcp.test", TYPE_A).encode().unwrap();
-        s.write_all(&(query.len() as u16).to_be_bytes()).await.unwrap();
+        s.write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
         s.write_all(&query).await.unwrap();
 
         let mut len = [0u8; 2];
@@ -1041,7 +1051,9 @@ mod tests {
         );
 
         // GET
-        let query = Message::query(0x8888, "doh2.test", TYPE_A).encode().unwrap();
+        let query = Message::query(0x8888, "doh2.test", TYPE_A)
+            .encode()
+            .unwrap();
         let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&query);
         let mut s = TcpStream::connect(addr).await.unwrap();
         let req = format!(
@@ -1104,11 +1116,10 @@ mod tests {
             let _ = serve_doh(ln, None, server_resolver, Duration::ZERO).await;
         });
 
-        let client = Resolver::with_servers(vec![NameServer::new(&format!(
-            "http://{}/dns-query",
-            addr
-        ))
-        .with_protocol("https")]);
+        let client =
+            Resolver::with_servers(vec![
+                NameServer::new(&format!("http://{}/dns-query", addr)).with_protocol("https")
+            ]);
 
         let ips = client.resolve("doh-client.test").await.unwrap();
         assert_eq!(

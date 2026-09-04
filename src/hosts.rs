@@ -257,7 +257,10 @@ mod tests {
             "example.com",
             vec![],
         )]);
-        assert_eq!(hosts.lookup("example.com"), Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(
+            hosts.lookup("example.com"),
+            Some("10.0.0.1".parse().unwrap())
+        );
         assert_eq!(hosts.lookup("sub.example.com"), None);
         assert_eq!(hosts.lookup("example.co"), None);
         assert_eq!(hosts.lookup(".example.com"), None);
