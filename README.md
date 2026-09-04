@@ -709,12 +709,6 @@ QUIC nodes can only be used as the first node of a proxy chain.
 
 ### HTTP/2
 
-> **Not implemented.** `-L http2://`, `-L h2://` and `-L h2c://` are rejected at
-> startup rather than quietly served as plaintext TCP. The `http2` handler
-> exists but falls back to HTTP/1.1, which gost cannot speak, so it is not
-> reachable from the CLI. The syntax below is gost's, kept as a reference for
-> what an implementation must accept. See [Implementation Status](#28-implementation-status).
-
 HTTP/2 transport supports two modes:
 
 **Standard Proxy** (`http2`): Acts as an HTTP/2 proxy using the CONNECT method, and is backwards-compatible with HTTPS proxies.
@@ -1170,12 +1164,10 @@ When both client and server are rt (or gost) instances, SOCKS5 connections negot
 
 Obfuscation transports disguise proxy traffic as benign protocols to evade deep packet inspection (DPI).
 
-> **Not implemented.** None of the three are reachable: `-L http+ohttp://`,
-> `-L http+otls://` and `-L obfs4://` are all rejected at startup rather than
-> served in cleartext. `ohttp` and `otls` have handshake code and round-trip
-> tests, but `otls` has no record framing, so neither is wired to the CLI;
-> obfs4 is types only, and go-gost v3 dropped it too. The syntax below is
-> gost's. See [Implementation Status](#28-implementation-status).
+> `ohttp` and `otls` work and are interop-tested against gost in both
+> directions. `obfs4` is **not implemented**: `-L obfs4://` is rejected at
+> startup, and go-gost v3 dropped it as well. See
+> [Implementation Status](#28-implementation-status).
 
 ### HTTP Obfuscation
 
@@ -1479,8 +1471,9 @@ transport on a middle hop. Both need a `gost` binary and `curl`.
 
 Currently passing, both directions: `http`, `socks5`, `socks4`, `ss`
 (aes-256-gcm and chacha20-ietf-poly1305), `relay`, `tls`, `ws`, `wss`, `mtls`,
-`mws`, `mwss`, `quic`, `kcp`, and `forward+ssh` (including a rejected password),
-plus chain authentication and multi-hop chains.
+`mws`, `mwss`, `quic`, `kcp`, `ohttp`, `otls`, and `forward+ssh` (including a
+rejected password), plus SOCKS5 methods 0x80 and 0x82, chain authentication
+and multi-hop chains.
 
 This is what the unit tests cannot establish. Byte-exact assertions prove a
 codec matches a spec as it was read; only a real peer proves the reading was
@@ -1519,7 +1512,7 @@ making them cross-implementation rather than self-consistent.
 | SOCKS5 UDP ASSOCIATE | Working | Real relay socket, per-datagram ACL, fragments dropped, torn down with the control connection |
 | SOCKS5 BIND | Working | Two-reply sequence |
 | SOCKS5 `CmdUDPTun` (0xF3) | Working | UDP over the TCP control connection, with the length carried in the repurposed `RSV` field as gost does. `Chain::dial_udp` uses it, so `-F socks5://` carries UDP |
-| SOCKS5 other gost extensions | Absent | MethodTLS 0x80, MethodTLSAuth 0x82, CmdMuxBind 0xF2 |
+| SOCKS5 gost extensions | Working | MethodTLS 0x80 and MethodTLSAuth 0x82 run the exchange, credentials included, inside TLS; verified against a real gost client, which offers 0x80 by default. CmdMuxBind 0xF2 binds a port and gives each peer its own smux stream (refused through a chain) |
 | SOCKS4/4a proxy | Working | CONNECT and BIND |
 | Auto-detect handler | Working | Refuses SOCKS4 when credentials are configured, as gost does |
 | Proxy chain (multi-hop) | Working | HTTP/SOCKS4/SOCKS4a/SOCKS5/ss/relay connectors with authentication; unknown protocols are a hard error. Transports layer mid-chain; mux, QUIC, KCP and SSH hops must be first, since they own their dial |
@@ -1527,13 +1520,13 @@ making them cross-implementation rather than self-consistent.
 | Shadowsocks over UDP (`ssu`) | Working | `salt || AEAD(addr+payload)` per datagram with a zero nonce and a fresh salt; per-datagram ACL. Relays through a SOCKS5 chain hop via `CmdUDPTun` |
 | Relay protocol | Working | Wire-compatible header, UDP length framing, lazy handshake |
 | TCP direct/remote forwarding | Working | Multi-target with a fail-filter selector |
-| UDP direct forwarding | Partial | Does not route through the chain; no idle expiry |
+| UDP direct forwarding | Working | Routes through the chain via `Chain::dial_udp`, with both directions bounded by an idle timeout |
 | UDP listener | Working | One virtual connection per source address, with backlog, per-peer queue and TTL expiry, so `-L udp://` is served by the ordinary handlers |
 | UDP remote forwarding (`rudp`) | Absent | Needs the UDP remote-forward listener |
 | DNS proxy | Working | udp, tcp, tls and https modes; multi-upstream with failover |
 | DNS resolver | Working | udp/tcp/DoT/DoH nameservers, cache with TTL, prefer ipv4/ipv6, EDNS0 client subnet. DoT not covered end to end |
 | Hosts file | Working | Exact-match, as in gost v2; live reload |
-| SNI proxy | Partial | Server side only; the client connector and the 0xFFFE host extension are absent |
+| SNI proxy | Partial | Server side honours gost's private 0xFFFE extension, recovering the real destination from behind the decoy SNI and stripping it before the origin. The client connector, which would move the name into that extension on the way out, is not wired |
 | Transparent proxy (TCP) | Working on Linux | SO_ORIGINAL_DST |
 | Transparent proxy (UDP) | Absent | Needs tproxy |
 | Authentication | Working | Inline credentials and secrets file, with live reload |
@@ -1546,9 +1539,10 @@ making them cross-implementation rather than self-consistent.
 | WS / WSS transport | Working | Listener and chain hop; default path `/ws` as in gost. `?compression=`/`?rbuf=` parse but have no effect (tungstenite has no equivalent) |
 | MTLS / MWS / MWSS transport | Working | Listener: one accepted connection becomes an smux session, every stream a separate handler invocation. Chain: `-F http+mtls://` opens a stream per dial on one reused session. Only supported on the first hop |
 | KCP transport | Working | ARQ via the `kcp` crate, with kcp-go's crypt (13 ciphers), snappy and smux layers hand-written and checked against vectors generated by kcp-go itself. Reed-Solomon parity is not generated (warned about at startup); losses fall back to KCP retransmission |
-| QUIC transport (listener) | Working | ALPN `http/3`, `quic/v1` as gost sets; one connection carries many streams; `?cipher=` AES-256-GCM datagram layer, `?keepalive=`/`?idle=`/`?ttl=`. No 0-RTT, no QUIC v2. Chain-side dialer exists but is not wired to `-F` |
-| HTTP/2, h2, h2c transport | Types only | The `http2` handler falls back to HTTP/1.1, which gost cannot speak |
-| Obfuscation (ohttp / otls) | Types only | Handshake only; otls has no record framing |
+| QUIC transport | Working | ALPN `http/3`, `quic/v1` as gost sets; one connection carries many streams; `?cipher=` AES-256-GCM datagram layer, `?keepalive=`/`?idle=`/`?ttl=`. No 0-RTT, no QUIC v2. `-F quic://` works on the first hop |
+| HTTP/2 tunnel (`h2`, `h2c`) | Working | One connection per HTTP/2 stream: request body out, response body back, with the flow-control window released as it reads. CONNECT form and `?path=` form, both directions |
+| HTTP/2 proxy (`http2`) | Working | Real HTTP/2 CONNECT and request forwarding with auth, bypass and chained dialling; ALPN `h2` advertised and requested. Streams served concurrently |
+| Obfuscation (ohttp / otls) | Working | `otls` frames every write as a TLS application-data record. Interop-verified against gost 2.12.0 both directions, which is what caught the two wire details below |
 | Obfuscation (obfs4) | Absent | Dropped in go-gost v3 as well |
 | SSH `forward` | Working | Real russh server and client, authentication mandatory. `direct+ssh`/`remote+ssh` chain hop with a pooled session |
 | SSH `gost-tunnel` transport | Absent | russh has a closed set of channel types and cannot open or accept gost's custom `gost-tunnel`. Rejected at startup rather than served as plaintext |
@@ -1611,7 +1605,7 @@ making them cross-implementation rather than self-consistent.
 
 ### Running Tests
 
-Run the full test suite (555 unit tests + 33 integration tests = 588 total):
+Run the full test suite (583 unit tests + 33 integration tests = 616 total):
 
 ```bash
 cargo test
@@ -1646,9 +1640,9 @@ cargo test test_chain_dial_through_socks5_proxy
 
 ### Test Categories
 
-The test suite contains 588 tests organized into unit tests (in each module's `#[cfg(test)]` block) and integration tests (in `tests/integration_tests.rs`). Passing tests are necessary but not sufficient: see [Interoperability](#27-interoperability) for the checks that run against a real gost binary, which caught three bugs the whole suite had passed.
+The test suite contains 616 tests organized into unit tests (in each module's `#[cfg(test)]` block) and integration tests (in `tests/integration_tests.rs`). Passing tests are necessary but not sufficient: see [Interoperability](#27-interoperability) for the checks that run against a real gost binary, which caught three bugs the whole suite had passed.
 
-**Unit Tests** (555): Verify individual functions and data structures in isolation. Examples include node URL parsing, bypass matcher logic, permission rule evaluation, configuration JSON parsing, KCP config mode presets, MuxFrame encode/decode, IPv4 header parsing, VSOCK address parsing, Shadowsocks key derivation, obfuscation handshake building, and platform-specific signal handler creation.
+**Unit Tests** (583): Verify individual functions and data structures in isolation. Examples include node URL parsing, bypass matcher logic, permission rule evaluation, configuration JSON parsing, KCP config mode presets, MuxFrame encode/decode, IPv4 header parsing, VSOCK address parsing, Shadowsocks key derivation, obfuscation handshake building, and platform-specific signal handler creation.
 
 **Integration Tests** (33): Start real listeners and verify end-to-end protocol behavior. These tests create actual server/client pairs communicating over loopback:
 
