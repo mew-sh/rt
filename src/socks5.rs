@@ -19,6 +19,11 @@ use crate::transport::transport;
 const SOCKS5_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
 const METHOD_USER_PASS: u8 = 0x02;
+/// gost's extended method: the SOCKS5 exchange continues inside TLS
+/// (socks.go:24-27).
+const METHOD_TLS: u8 = 0x80;
+/// The same, with the user/pass exchange carried inside that TLS session.
+const METHOD_TLS_AUTH: u8 = 0x82;
 const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 
 const CMD_CONNECT: u8 = 0x01;
@@ -26,6 +31,9 @@ const CMD_BIND: u8 = 0x02;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
 /// gost's private SOCKS5 command for tunnelling UDP datagrams over the TCP
 /// control connection (`CmdUDPTun`, socks.go:37).
+/// gost's extended request: bind a port and carry every accepted connection
+/// as a stream on one multiplexed control connection (socks.go:33-35).
+const CMD_MUX_BIND: u8 = 0xF2;
 const CMD_UDP_TUN: u8 = 0xF3;
 
 /// Maximum size of a single UDP datagram we are willing to relay.
@@ -601,6 +609,31 @@ impl Socks5Handler {
         Self { options }
     }
 
+    /// The TLS identity for gost's `MethodTLS` / `MethodTLSAuth`.
+    ///
+    /// Built from the listener's own `?cert=`/`?key=`, falling back to a
+    /// generated self-signed certificate. gost's client sets
+    /// `InsecureSkipVerify` for these methods (socks.go:1867), so the
+    /// certificate is only there to carry the key exchange.
+    fn tls_acceptor(
+        &self,
+    ) -> Result<tokio_rustls::TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
+        let node = self.options.node.as_ref();
+        let cert = node.and_then(|n| n.get("cert")).unwrap_or("");
+        let key = node.and_then(|n| n.get("key")).unwrap_or("");
+
+        let config = if !cert.is_empty() && !key.is_empty() {
+            crate::tls_listener::server_config_from_files(cert, key)?
+        } else {
+            let host = node
+                .and_then(|n| n.get("host"))
+                .filter(|h| !h.is_empty())
+                .unwrap_or("localhost");
+            crate::tls_listener::self_signed_config(host)?.0
+        };
+        Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+    }
+
     async fn authenticate(&self, user: &str, password: &str) -> bool {
         if let Some(ref auth) = self.options.authenticator {
             auth.authenticate(user, password)
@@ -719,6 +752,109 @@ impl Socks5Handler {
     }
 
     /// gost: socks5Handler.handleBind (socks.go:981-1018)
+    /// gost's `CmdMuxBind` (socks.go:1526-1620).
+    ///
+    /// Binds the requested port, then turns the control connection into an
+    /// smux session and hands every accepted peer its own stream. The roles
+    /// are inverted relative to the usual listener: the SOCKS5 *server* is the
+    /// smux client here, because it is the side that opens a stream per
+    /// arrival.
+    async fn handle_mux_bind(
+        &self,
+        mut conn: ProxyConn,
+        target: &str,
+        peer_addr: &str,
+    ) -> Result<(), HandlerError> {
+        let chain = self.options.chain.clone().unwrap_or_default();
+        if !chain.is_empty() {
+            // gost forwards the request to the last hop rather than binding
+            // locally; that path is not implemented, and refusing beats
+            // binding somewhere the operator did not ask for.
+            send_reply(&mut conn, REP_CMD_NOT_SUPPORTED, "0.0.0.0", 0).await?;
+            return Err(HandlerError::Proxy(
+                "socks5 mbind through a chain is not implemented".into(),
+            ));
+        }
+
+        if !Can(
+            "rtcp",
+            target,
+            self.options.whitelist.as_ref(),
+            self.options.blacklist.as_ref(),
+        ) {
+            warn!(
+                "[socks5-mbind] {} - unauthorized to tcp mbind to {}",
+                peer_addr, target
+            );
+            send_reply(&mut conn, REP_NOT_ALLOWED, "0.0.0.0", 0).await?;
+            return Err(HandlerError::Forbidden);
+        }
+
+        // Strict, as gost is: a port already in use is an error, not a
+        // silently different port.
+        let listener = match TcpListener::bind(target).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("[socks5-mbind] {} -> {} : {}", peer_addr, target, e);
+                send_reply(&mut conn, REP_GENERAL_FAILURE, "0.0.0.0", 0).await?;
+                return Err(HandlerError::Io(e));
+            }
+        };
+        let bound = listener.local_addr()?;
+
+        // gost reports the listener's port against the address the client
+        // reached, since the bind address itself may be a wildcard.
+        let host = conn
+            .local_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| bound.ip().to_string());
+        send_reply(&mut conn, REP_SUCCESS, &host, bound.port()).await?;
+        info!(
+            "[socks5-mbind] {} - BIND ON {}:{} OK",
+            peer_addr,
+            host,
+            bound.port()
+        );
+
+        let session = crate::mux::MuxSession::client(conn, crate::mux::MuxConfig::default())
+            .map_err(HandlerError::Io)?;
+        let session = std::sync::Arc::new(session);
+
+        // gost accepts and immediately closes peer-opened streams; nothing on
+        // this side ever handles an inbound stream.
+        let drain = session.clone();
+        let drainer = tokio::spawn(async move {
+            while let Some(stream) = drain.accept_stream().await {
+                drop(stream);
+            }
+        });
+
+        let result = loop {
+            let (peer_conn, from) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => break Err(HandlerError::Io(e)),
+            };
+            debug!("[socks5-mbind] {} <- ACCEPT peer {}", peer_addr, from);
+
+            let stream = match session.open_stream().await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("[socks5-mbind] {} - cannot open stream: {}", peer_addr, e);
+                    break Err(HandlerError::Io(e));
+                }
+            };
+            tokio::spawn(async move {
+                if let Err(e) = transport(peer_conn, stream).await {
+                    debug!("[socks5-mbind] peer {} : {}", from, e);
+                }
+            });
+        };
+
+        drainer.abort();
+        info!("[socks5-mbind] {} >-< {}:{}", peer_addr, host, bound.port());
+        result
+    }
+
     async fn handle_bind(
         &self,
         mut conn: ProxyConn,
@@ -1193,10 +1329,51 @@ impl Handler for Socks5Handler {
 
         let requires_auth = self.options.authenticator.is_some();
 
+        // gost's serverSelector: MethodTLS wins if the client offers it, and
+        // configured credentials promote whatever was chosen to its
+        // authenticating variant (socks.go:125-149).
+        let mut method = if methods.contains(&METHOD_TLS) {
+            METHOD_TLS
+        } else {
+            METHOD_NO_AUTH
+        };
         if requires_auth {
-            if methods.contains(&METHOD_USER_PASS) {
-                conn.write_all(&[SOCKS5_VERSION, METHOD_USER_PASS]).await?;
+            method = match method {
+                METHOD_TLS => METHOD_TLS_AUTH,
+                _ => METHOD_USER_PASS,
+            };
+        }
 
+        // Credentials are mandatory once configured, so a client offering
+        // neither user/pass nor TLS has nothing acceptable left.
+        if requires_auth && !methods.contains(&METHOD_USER_PASS) && !methods.contains(&METHOD_TLS) {
+            conn.write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE])
+                .await?;
+            return Err(HandlerError::AuthFailed);
+        }
+
+        conn.write_all(&[SOCKS5_VERSION, method]).await?;
+
+        // A TLS method means the rest of the exchange -- the credentials
+        // included -- runs inside the tunnel, so the socket is replaced before
+        // anything else is read (socks.go:155-160).
+        if method == METHOD_TLS || method == METHOD_TLS_AUTH {
+            let acceptor = self.tls_acceptor().map_err(|e| {
+                warn!("[socks5] {} cannot serve MethodTLS: {}", peer_addr, e);
+                HandlerError::Proxy(format!("socks5 tls: {e}"))
+            })?;
+            let peer = conn.peer_addr();
+            let local = conn.local_addr();
+            let tls = acceptor
+                .accept(conn)
+                .await
+                .map_err(|e| HandlerError::Proxy(format!("socks5 tls handshake: {e}")))?;
+            conn = ProxyConn::layered(Box::new(tls), peer, local);
+            debug!("[socks5] {} negotiated method {:#04x}", peer_addr, method);
+        }
+
+        if method == METHOD_USER_PASS || method == METHOD_TLS_AUTH {
+            {
                 // Read auth request
                 let mut auth_ver = [0u8; 1];
                 conn.read_exact(&mut auth_ver).await?;
@@ -1222,13 +1399,7 @@ impl Handler for Socks5Handler {
                     warn!("[socks5] {} authentication failed for {}", peer_addr, user);
                     return Err(HandlerError::AuthFailed);
                 }
-            } else {
-                conn.write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE])
-                    .await?;
-                return Err(HandlerError::AuthFailed);
             }
-        } else {
-            conn.write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH]).await?;
         }
 
         // Read request
@@ -1247,6 +1418,7 @@ impl Handler for Socks5Handler {
         match req_header[1] {
             CMD_CONNECT => self.handle_connect(conn, &target, &peer_addr).await,
             CMD_BIND => self.handle_bind(conn, &target, &peer_addr).await,
+            CMD_MUX_BIND => self.handle_mux_bind(conn, &target, &peer_addr).await,
             CMD_UDP_ASSOCIATE => self.handle_udp_relay(conn, &target, &peer_addr).await,
             CMD_UDP_TUN => self.handle_udp_tunnel(conn, &target, &peer_addr).await,
             _ => {
@@ -2127,6 +2299,68 @@ mod tests {
         client.write_all(b"client->peer").await.unwrap();
         let n = peer.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"client->peer");
+    }
+
+    #[tokio::test]
+    async fn test_socks5_mux_bind_carries_each_peer_on_its_own_stream() {
+        let proxy_addr = spawn_proxy(HandlerOptions::default()).await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        greet(&mut client).await;
+
+        let req = [0x05, CMD_MUX_BIND, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0, 0];
+        client.write_all(&req).await.unwrap();
+
+        let (rep, host, port) = read_reply(&mut client).await;
+        assert_eq!(rep, REP_SUCCESS);
+        assert_ne!(port, 0, "mbind must report the real bound port");
+        let bound: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
+
+        // Roles are inverted: the SOCKS5 server drives the smux client, so the
+        // client that asked for the bind is the smux server.
+        let session =
+            crate::mux::MuxSession::server(client, crate::mux::MuxConfig::default()).unwrap();
+
+        // Two peers, to prove they are separated rather than interleaved onto
+        // one connection.
+        for marker in [b"first-peer".as_slice(), b"second-peer".as_slice()] {
+            let mut peer = TcpStream::connect(bound).await.unwrap();
+            peer.write_all(marker).await.unwrap();
+            peer.flush().await.unwrap();
+
+            let mut stream = session
+                .accept_stream()
+                .await
+                .expect("each accepted peer must arrive as a stream");
+
+            let mut got = vec![0u8; marker.len()];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, marker);
+
+            stream.write_all(b"ack").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut back = [0u8; 3];
+            peer.read_exact(&mut back).await.unwrap();
+            assert_eq!(&back, b"ack");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_socks5_mux_bind_denied_by_blacklist() {
+        // mbind is checked against the `rtcp` permission, as gost does.
+        let bl = crate::permissions::Permissions::parse("rtcp:*:*").unwrap();
+        let proxy_addr = spawn_proxy(HandlerOptions {
+            blacklist: Some(bl),
+            ..Default::default()
+        })
+        .await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        greet(&mut client).await;
+
+        let req = [0x05, CMD_MUX_BIND, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0, 0];
+        client.write_all(&req).await.unwrap();
+
+        let (rep, _, _) = read_reply(&mut client).await;
+        assert_eq!(rep, REP_NOT_ALLOWED);
     }
 
     #[tokio::test]

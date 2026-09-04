@@ -939,7 +939,7 @@ async fn connect_via(
                 })?;
             Ok(ProxyConn::layered(Box::new(tunnel), peer, local))
         }
-        "socks5" => socks5_connect(stream, target, node.user.as_ref()).await,
+        "socks5" => socks5_connect(stream, target, node).await,
         "socks4" => socks4_connect(stream, target, node.user.as_ref(), false).await,
         "socks4a" => socks4_connect(stream, target, node.user.as_ref(), true).await,
         "ss" => {
@@ -1112,25 +1112,35 @@ async fn socks4_connect(
 
 /// SOCKS5 CONNECT through a proxy.
 async fn socks5_connect(
-    mut stream: ProxyConn,
+    stream: ProxyConn,
     target: &str,
-    user: Option<&(String, Option<String>)>,
+    node: &Node,
 ) -> Result<ProxyConn, ChainError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const METHOD_NO_AUTH: u8 = 0x00;
     const METHOD_USER_PASS: u8 = 0x02;
+    const METHOD_TLS: u8 = 0x80;
+    const METHOD_TLS_AUTH: u8 = 0x82;
     const METHOD_NONE_ACCEPTABLE: u8 = 0xFF;
 
+    let user = node.user.as_ref();
+
     // Offer user/pass as well when credentials are configured, otherwise a
-    // proxy that requires authentication can never be traversed.
-    let methods: &[u8] = if user.is_some() {
-        &[METHOD_NO_AUTH, METHOD_USER_PASS]
-    } else {
-        &[METHOD_NO_AUTH]
-    };
+    // proxy that requires authentication can never be traversed. gost also
+    // offers its TLS method unless `?notls=true` (socks.go:1865-1877); a gost
+    // server picks it when offered, so not offering it silently downgrades a
+    // hop that gost would have encrypted.
+    let mut methods = vec![METHOD_NO_AUTH];
+    if user.is_some() {
+        methods.push(METHOD_USER_PASS);
+    }
+    if !node.get_bool("notls") {
+        methods.push(METHOD_TLS);
+    }
     let mut greeting = vec![0x05, methods.len() as u8];
-    greeting.extend_from_slice(methods);
+    greeting.extend_from_slice(&methods);
+    let mut stream = stream;
     stream.write_all(&greeting).await.map_err(ChainError::Io)?;
 
     let mut buf = [0u8; 2];
@@ -1138,9 +1148,25 @@ async fn socks5_connect(
     if buf[0] != 0x05 {
         return Err(ChainError::ProxyError("SOCKS5 handshake failed".into()));
     }
+
+    // Both TLS methods replace the socket before anything else is exchanged.
+    // gost skips verification here (socks.go:1867): the certificate only
+    // carries the key exchange.
+    if buf[1] == METHOD_TLS || buf[1] == METHOD_TLS_AUTH {
+        let host = hop_hostname(node);
+        let peer = stream.peer_addr();
+        let local = stream.local_addr();
+        let tls = crate::tls_transport::tls_connect_stream(stream, &host, true)
+            .await
+            .map_err(|e| {
+                ChainError::ProxyError(format!("SOCKS5 TLS handshake with {} failed: {}", host, e))
+            })?;
+        stream = ProxyConn::layered(Box::new(tls), peer, local);
+    }
+
     match buf[1] {
-        METHOD_NO_AUTH => {}
-        METHOD_USER_PASS => {
+        METHOD_NO_AUTH | METHOD_TLS => {}
+        METHOD_USER_PASS | METHOD_TLS_AUTH => {
             let (name, pass) = user.ok_or_else(|| {
                 ChainError::ProxyError("proxy requires credentials but none were configured".into())
             })?;
