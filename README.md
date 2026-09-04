@@ -1444,7 +1444,7 @@ making them cross-implementation rather than self-consistent.
 | Multiplexing (smux) | Absent | The existing frame layout is not smux-compatible |
 | TUN / TAP | Types only | Configures an existing interface; no device creation or packet loop |
 | FakeTCP, VSOCK | Types only | Need raw sockets and a vsock crate |
-| Socket mark / interface bind | Partial | Correct Linux implementations, not yet applied to outbound sockets |
+| Socket mark / interface bind | Working on Linux | `-M` / `-I` applied to outbound sockets before connect; no-op elsewhere |
 
 ## 27. Module Reference
 

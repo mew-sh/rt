@@ -148,10 +148,7 @@ impl Chain {
 
         if self.is_empty() {
             // Direct connection
-            let conn = tokio::time::timeout(timeout, TcpStream::connect(&target))
-                .await
-                .map_err(|_| ChainError::Timeout)?
-                .map_err(ChainError::Io)?;
+            let conn = self.connect_tcp(&target, timeout).await?;
             return Ok(ProxyConn::from_tcp(conn));
         }
 
@@ -164,10 +161,7 @@ impl Chain {
         // Connect to first node
         let first = &nodes[0];
         debug!("[chain] connecting to first node: {}", first.addr);
-        let conn = tokio::time::timeout(timeout, TcpStream::connect(&first.addr))
-            .await
-            .map_err(|_| ChainError::Timeout)?
-            .map_err(ChainError::Io)?;
+        let conn = self.connect_tcp(&first.addr, timeout).await?;
 
         // Walk the chain, asking each node to connect to the next one, and the
         // last node to connect to the real target. Each hop layers its
@@ -185,6 +179,54 @@ impl Chain {
         }
 
         Ok(current)
+    }
+
+    /// Opens an outbound TCP connection, applying the chain's `-M` socket mark
+    /// and `-I` interface binding.
+    ///
+    /// Both have to be set on the socket *before* it connects, so this cannot
+    /// use `TcpStream::connect`. gost does the same thing from its dialer's
+    /// `Control` callback (chain.go:167-191).
+    async fn connect_tcp(&self, addr: &str, timeout: Duration) -> Result<TcpStream, ChainError> {
+        if self.mark == 0 && self.interface.is_empty() {
+            return tokio::time::timeout(timeout, TcpStream::connect(addr))
+                .await
+                .map_err(|_| ChainError::Timeout)?
+                .map_err(ChainError::Io);
+        }
+
+        // TcpSocket needs a resolved address, unlike TcpStream::connect.
+        let sockaddr = tokio::time::timeout(timeout, tokio::net::lookup_host(addr))
+            .await
+            .map_err(|_| ChainError::Timeout)?
+            .map_err(ChainError::Io)?
+            .next()
+            .ok_or_else(|| ChainError::ProxyError(format!("could not resolve {}", addr)))?;
+
+        let socket = if sockaddr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        }
+        .map_err(ChainError::Io)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            if self.mark != 0 {
+                crate::sockopts::set_socket_mark(fd, self.mark).map_err(ChainError::Io)?;
+            }
+            if !self.interface.is_empty() {
+                crate::sockopts::set_socket_interface(fd, &self.interface)
+                    .map_err(ChainError::Io)?;
+            }
+        }
+
+        tokio::time::timeout(timeout, socket.connect(sockaddr))
+            .await
+            .map_err(|_| ChainError::Timeout)?
+            .map_err(ChainError::Io)
     }
 
     async fn resolve(
@@ -657,6 +699,38 @@ mod tests {
         let conn = c.dial(&addr.to_string()).await;
         assert!(conn.is_ok());
         handle.await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_chain_direct_dial_with_socket_options() {
+        // A non-zero mark or a bound interface takes the TcpSocket path rather
+        // than TcpStream::connect, because both options must be set before the
+        // socket connects. The setsockopt calls themselves are Linux-only, but
+        // the alternate connect path runs everywhere and must still work.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut c = Chain::empty();
+        c.mark = 100;
+
+        let handle = tokio::spawn(async move {
+            let (_conn, _) = listener.accept().await.unwrap();
+        });
+
+        assert!(
+            c.dial(&addr.to_string()).await.is_ok(),
+            "setting a socket mark must not break dialling"
+        );
+        handle.await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_chain_direct_dial_with_socket_options_reports_bad_host() {
+        // The TcpSocket path resolves the address itself, so a name that does
+        // not resolve has to surface as an error rather than a panic.
+        let mut c = Chain::empty();
+        c.mark = 100;
+        assert!(c.dial("no-such-host.invalid:80").await.is_err());
     }
 
     #[tokio::test]
