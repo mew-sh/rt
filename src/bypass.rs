@@ -1,5 +1,48 @@
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
+use std::time::Duration;
+
+use crate::auth::{parse_go_duration, split_line_ref};
+use crate::permissions::split_host_port;
+use crate::reload::{Reloader, Stoppable};
+
+/// Parses a boolean exactly like Go's `strconv.ParseBool`.
+///
+/// Accepts: 1, t, T, TRUE, true, True, 0, f, F, FALSE, false, False.
+/// Everything else is an error.
+///
+/// The previous `reverse` handling only recognised "true"/"1", so a config line
+/// `reverse True` silently yielded `reversed = false` and INVERTED the entire
+/// bypass policy (gost: bypass.go:237).
+pub fn parse_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// Strips a valid port from `addr`, mirroring gost's `Bypass.Contains`
+/// (bypass.go:161-166): it uses `net.SplitHostPort` and only strips when the
+/// port parses to a value > 0.
+///
+/// The old hand-rolled version kept the brackets of an IPv6 literal
+/// (`"[::1]:80"` -> `"[::1]"`), which then failed `IpAddr::parse`, so IPv6 and
+/// CIDR bypass rules never fired. It also stripped `":0"`, which gost does not.
+fn strip_port(addr: &str) -> &str {
+    if let Ok((host, port)) = split_host_port(addr) {
+        if !host.is_empty() && !port.is_empty() {
+            // gost uses strconv.Atoi, which accepts values beyond u16.
+            if let Ok(p) = port.parse::<i64>() {
+                if p > 0 {
+                    return host;
+                }
+            }
+        }
+    }
+    addr
+}
 
 /// Matcher is a generic pattern matcher.
 pub trait Matcher: Send + Sync + std::fmt::Debug {
@@ -104,6 +147,14 @@ impl Matcher for DomainMatcher {
 pub struct Bypass {
     matchers: RwLock<Vec<Box<dyn Matcher>>>,
     reversed: RwLock<bool>,
+    /// Reload period parsed from the `reload <duration>` directive
+    /// (gost: bypass.go:231-234,259). Zero means "no live reloading".
+    period: RwLock<Duration>,
+    /// gost signals "stopped" with a closed channel and a negative Period().
+    /// `reload::period_reload` cannot express a negative Duration, so the
+    /// stopped state lives in this flag and `period()` reports Duration::ZERO
+    /// once stopped, which makes `period_reload` return.
+    stopped: AtomicBool,
 }
 
 impl Bypass {
@@ -111,6 +162,8 @@ impl Bypass {
         Self {
             matchers: RwLock::new(matchers),
             reversed: RwLock::new(reversed),
+            period: RwLock::new(Duration::ZERO),
+            stopped: AtomicBool::new(false),
         }
     }
 
@@ -126,22 +179,8 @@ impl Bypass {
             return false;
         }
 
-        // Strip port if present
-        let host = if let Some(idx) = addr.rfind(':') {
-            let possible_port = &addr[idx + 1..];
-            if possible_port.parse::<u16>().is_ok() {
-                // Check if it's actually IPv6 without brackets
-                if addr.starts_with('[') || addr.matches(':').count() <= 1 {
-                    &addr[..idx]
-                } else {
-                    addr
-                }
-            } else {
-                addr
-            }
-        } else {
-            addr
-        };
+        // Try to strip the port (see strip_port).
+        let host = strip_port(addr);
 
         let matchers = self.matchers.read().unwrap();
         if matchers.is_empty() {
@@ -164,22 +203,41 @@ impl Bypass {
 
     /// Reload from a reader (line-based config).
     pub fn reload(&self, reader: impl std::io::Read) -> std::io::Result<()> {
+        self.reload_impl(reader)
+    }
+
+    fn reload_impl(&self, reader: impl std::io::Read) -> std::io::Result<()> {
         use std::io::BufRead;
+
+        if self.stopped() {
+            return Ok(());
+        }
+
         let buf = std::io::BufReader::new(reader);
         let mut matchers: Vec<Box<dyn Matcher>> = Vec::new();
         let mut reversed = false;
+        let mut period = Duration::ZERO;
 
         for line in buf.lines() {
             let line = line?;
-            let parts: Vec<&str> = crate::auth::split_line_ref(&line);
+            // gost's bypass reader uses the package-level splitLine, which DOES
+            // strip inline '#' comments (gost.go:195-197). That differs on
+            // purpose from the auth-file reader; see auth::split_auth_line.
+            let parts: Vec<&str> = split_line_ref(&line);
             if parts.is_empty() {
                 continue;
             }
             match parts[0] {
-                "reload" => {} // handled externally
-                "reverse" => {
+                "reload" => {
+                    // gost: period, _ = time.ParseDuration(ss[1])
                     if parts.len() > 1 {
-                        reversed = parts[1] == "true" || parts[1] == "1";
+                        period = parse_go_duration(parts[1]).unwrap_or(Duration::ZERO);
+                    }
+                }
+                "reverse" => {
+                    // gost: reversed, _ = strconv.ParseBool(ss[1])
+                    if parts.len() > 1 {
+                        reversed = parse_bool(parts[1]).unwrap_or(false);
                     }
                 }
                 _ => {
@@ -192,7 +250,51 @@ impl Bypass {
 
         *self.matchers.write().unwrap() = matchers;
         *self.reversed.write().unwrap() = reversed;
+        *self.period.write().unwrap() = period;
         Ok(())
+    }
+
+    /// Returns the reload period (gost: `Period()`), or `Duration::ZERO` when
+    /// stopped.
+    pub fn period(&self) -> Duration {
+        self.period_impl()
+    }
+
+    fn period_impl(&self) -> Duration {
+        if self.stopped() {
+            return Duration::ZERO;
+        }
+        *self.period.read().unwrap()
+    }
+
+    /// Stops live reloading (gost: `Stop()`).
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Reports whether live reloading has been stopped (gost: `Stopped()`).
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+}
+
+impl Reloader for Bypass {
+    fn reload(&self, reader: Box<dyn std::io::Read + Send>) -> std::io::Result<()> {
+        self.reload_impl(reader)
+    }
+
+    fn period(&self) -> Duration {
+        self.period_impl()
+    }
+}
+
+impl Stoppable for Bypass {
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 }
 
@@ -200,19 +302,6 @@ impl Default for Bypass {
     fn default() -> Self {
         Self::new(false, Vec::new())
     }
-}
-
-// We need to add a public split_line_ref helper to auth module
-// For now, we duplicate the logic here
-
-fn _split_line(line: &str) -> Vec<String> {
-    let line = if let Some(idx) = line.find('#') {
-        &line[..idx]
-    } else {
-        line
-    };
-    let line = line.replace('\t', " ");
-    line.split_whitespace().map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]
@@ -300,5 +389,153 @@ mod tests {
     fn test_bypass_empty() {
         let bp = Bypass::new(false, Vec::new());
         assert!(!bp.contains("anything"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Defect E: IPv6 port stripping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_port() {
+        assert_eq!(strip_port("192.168.1.1:8080"), "192.168.1.1");
+        assert_eq!(strip_port("example.com:443"), "example.com");
+        // Brackets must be removed, not retained.
+        assert_eq!(strip_port("[::1]:80"), "::1");
+        assert_eq!(strip_port("[2001:db8::1]:443"), "2001:db8::1");
+        // No port -> unchanged.
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("::1"), "::1");
+        assert_eq!(strip_port("2001:db8::1"), "2001:db8::1");
+        assert_eq!(strip_port("192.168.1.1"), "192.168.1.1");
+        // gost only strips when port > 0.
+        assert_eq!(strip_port("host:0"), "host:0");
+        assert_eq!(strip_port("[::1]:0"), "[::1]:0");
+        // Non-numeric "port" -> unchanged.
+        assert_eq!(strip_port("host:abc"), "host:abc");
+    }
+
+    #[test]
+    fn test_bypass_bracketed_ipv6_ip_rule() {
+        let bp = Bypass::from_patterns(false, &["::1", "2001:db8::1"]);
+        // Previously "[::1]" was passed to IpAddr::parse and never matched.
+        assert!(bp.contains("[::1]:80"), "bracketed IPv6 must match ip rule");
+        assert!(bp.contains("[::1]:22"));
+        assert!(bp.contains("::1"));
+        assert!(bp.contains("[2001:db8::1]:443"));
+        assert!(!bp.contains("[2001:db8::2]:443"));
+    }
+
+    #[test]
+    fn test_bypass_bracketed_ipv6_cidr_rule() {
+        let bp = Bypass::from_patterns(false, &["2001:db8::/32"]);
+        assert!(
+            bp.contains("[2001:db8::1]:443"),
+            "bracketed IPv6 must match cidr rule"
+        );
+        assert!(bp.contains("2001:db8::1"));
+        assert!(!bp.contains("[2001:db9::1]:443"));
+    }
+
+    #[test]
+    fn test_bypass_does_not_strip_zero_port() {
+        // gost strips the port only when it parses to > 0.
+        let bp = Bypass::from_patterns(false, &["example.com"]);
+        assert!(bp.contains("example.com:443"));
+        assert!(!bp.contains("example.com:0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Defect F: strconv.ParseBool for the `reverse` directive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_bool_matches_go() {
+        for s in ["1", "t", "T", "TRUE", "true", "True"] {
+            assert_eq!(parse_bool(s), Some(true), "{s} should be true");
+        }
+        for s in ["0", "f", "F", "FALSE", "false", "False"] {
+            assert_eq!(parse_bool(s), Some(false), "{s} should be false");
+        }
+        for s in ["", "yes", "no", "tRuE", "TrUe", "2", "on"] {
+            assert_eq!(parse_bool(s), None, "{s} should be an error");
+        }
+    }
+
+    #[test]
+    fn test_bypass_reload_reverse_true_capitalised() {
+        // `reverse True` previously yielded reversed = false, inverting the
+        // whole policy.
+        for directive in ["reverse True", "reverse TRUE", "reverse t", "reverse T"] {
+            let bp = Bypass::default();
+            let cfg = format!("{directive}\n192.168.1.0/24\n");
+            bp.reload(cfg.as_bytes()).unwrap();
+            assert!(bp.reversed(), "`{directive}` must set reversed = true");
+            assert!(!bp.contains("192.168.1.1"));
+            assert!(bp.contains("10.0.0.1"));
+        }
+    }
+
+    #[test]
+    fn test_bypass_reload_reverse_false_forms() {
+        for directive in ["reverse False", "reverse 0", "reverse f", "reverse bogus"] {
+            let bp = Bypass::default();
+            let cfg = format!("{directive}\n192.168.1.0/24\n");
+            bp.reload(cfg.as_bytes()).unwrap();
+            assert!(!bp.reversed(), "`{directive}` must set reversed = false");
+            assert!(bp.contains("192.168.1.1"));
+        }
+    }
+
+    #[test]
+    fn test_bypass_reload_strips_inline_comments() {
+        // gost's bypass reader (splitLine) DOES strip inline '#'.
+        let bp = Bypass::default();
+        bp.reload(&b"reverse true # invert\n192.168.1.0/24 # lan\n# whole line\n"[..])
+            .unwrap();
+        assert!(bp.reversed());
+        assert!(!bp.contains("192.168.1.1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Defect H: the `reload` directive is stored and exposed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bypass_reload_period_is_stored() {
+        let bp = Bypass::default();
+        assert_eq!(bp.period(), Duration::ZERO);
+
+        bp.reload(&b"reload 30s\n192.168.1.0/24\n"[..]).unwrap();
+        assert_eq!(bp.period(), Duration::from_secs(30));
+        // The `reload` line must not become a matcher.
+        assert!(!bp.contains("reload"));
+        assert!(bp.contains("192.168.1.1"));
+
+        bp.reload(&b"reload 2m\n"[..]).unwrap();
+        assert_eq!(bp.period(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_bypass_stop_makes_period_zero_and_reload_noop() {
+        let bp = Bypass::default();
+        bp.reload(&b"reload 30s\n192.168.1.0/24\n"[..]).unwrap();
+        assert!(!bp.stopped());
+
+        bp.stop();
+        assert!(bp.stopped());
+        assert_eq!(bp.period(), Duration::ZERO);
+
+        bp.reload(&b"10.0.0.0/8\n"[..]).unwrap();
+        assert!(bp.contains("192.168.1.1"));
+        assert!(!bp.contains("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_bypass_reloader_trait_impl() {
+        let bp = Bypass::default();
+        Reloader::reload(&bp, Box::new(&b"reload 15s\nexample.com\n"[..])).unwrap();
+        let r: &dyn Reloader = &bp;
+        assert_eq!(r.period(), Duration::from_secs(15));
+        assert!(bp.contains("example.com:80"));
     }
 }
