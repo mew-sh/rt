@@ -10,26 +10,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # --------------------------------------------------------------------------
-  # Lint
-  # --------------------------------------------------------------------------
-  lint:
-    name: Lint
+  # Formatting and lints only need one platform.
+  check:
+    name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt, clippy
+
       - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+
+      - name: Format
+        run: cargo fmt --all --check
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-  # --------------------------------------------------------------------------
-  # Test matrix (Linux, macOS, Windows)
-  # --------------------------------------------------------------------------
+  # Tests run on every platform on purpose. This crate has
+  # `#[cfg(target_os = "linux")]` code — SO_MARK, SO_BINDTODEVICE and
+  # SO_ORIGINAL_DST — that is not even compiled elsewhere, and a Linux-only
+  # bug in it has already reached this repository once. Testing a single
+  # platform would not have caught it.
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -38,10 +42,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
       - uses: dtolnay/rust-toolchain@stable
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
       - name: Build
-        run: cargo build --verbose
-      - name: Run tests
-        run: cargo test --verbose
+        run: cargo build --locked --verbose
+
+      - name: Test
+        run: cargo test --all --locked --verbose
