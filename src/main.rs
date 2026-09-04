@@ -345,7 +345,7 @@ fn load_secrets_file(path: &str) -> Result<LocalAuthenticator, std::io::Error> {
 /// between a listener and the handler dispatch, so accepting them would serve
 /// plaintext TCP under an encrypted-looking scheme.
 const SUPPORTED_LISTENER_TRANSPORTS: &[&str] = &[
-    "tcp", "tls", "ws", "wss", "mtls", "mws", "mwss", "udp", "rtcp", "rudp", "dns", "redu",
+    "tcp", "tls", "ws", "wss", "mtls", "mws", "mwss", "quic", "udp", "rtcp", "rudp", "dns", "redu",
 ];
 
 fn ensure_listener_transport_supported(
@@ -495,6 +495,19 @@ async fn run_server(
         "tls" => {
             let config = tls_server_config(&node)?;
             let server = TlsServer::new(&addr, config, handler).await?;
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
+        // QUIC carries many bidirectional streams per connection, so like the
+        // multiplexed transports one connection yields many handler calls.
+        "quic" => {
+            let quic = quic_transport::quic_config_from_node(&node)?;
+            let server = QuicServer::new(&addr, tls_server_config(&node)?, quic, handler).await?;
             let server_cancel = server.cancel_token();
             let cancel_clone = cancel.clone();
             tokio::spawn(async move {

@@ -1455,7 +1455,7 @@ making them cross-implementation rather than self-consistent.
 | WS / WSS transport | Working | Listener and chain hop; default path `/ws` as in gost. `?compression=`/`?rbuf=` parse but have no effect (tungstenite has no equivalent) |
 | MTLS / MWS / MWSS transport | Working | Listener: one accepted connection becomes an smux session, every stream a separate handler invocation. Chain: `-F http+mtls://` opens a stream per dial on one reused session. Only supported on the first hop |
 | KCP transport | Types only | Config parsing only; no KCP crate |
-| QUIC transport | Types only | quinn present but no accept loop and no ALPN |
+| QUIC transport (listener) | Working | ALPN `http/3`, `quic/v1` as gost sets; one connection carries many streams; `?cipher=` AES-256-GCM datagram layer, `?keepalive=`/`?idle=`/`?ttl=`. No 0-RTT, no QUIC v2. Chain-side dialer exists but is not wired to `-F` |
 | HTTP/2, h2, h2c transport | Types only | The `http2` handler falls back to HTTP/1.1, which gost cannot speak |
 | Obfuscation (ohttp / otls) | Types only | Handshake only; otls has no record framing |
 | Obfuscation (obfs4) | Absent | Dropped in go-gost v3 as well |

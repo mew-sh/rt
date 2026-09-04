@@ -71,7 +71,11 @@ pub use mux_transport::{
 pub use node::{Node, NodeGroup, ParseNodeError};
 pub use obfs::{Obfs4Transporter, ObfsHttpTransporter, ObfsTlsTransporter};
 pub use permissions::{Can, Permissions, PortRange};
-pub use quic_transport::{QuicConfig, QuicListener, QuicTransporter};
+pub use quic_transport::{
+    alpn_protocols, key_from_cipher, negotiated_alpn, quic_config_from_node,
+    quic_transport_config, ConnectionCount, QuicConfig, QuicDialer, QuicListener, QuicServer,
+    QuicStream, QuicTransporter, QUIC_ALPN,
+};
 pub use redirect::TcpRedirectHandler;
 pub use relay::{RelayConn, RelayConnector, RelayHandler};
 pub use reload::{Reloader, Stoppable};
