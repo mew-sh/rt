@@ -23,6 +23,7 @@ pub mod http2_transport;
 pub mod http_proxy;
 pub mod kcp;
 pub mod mux;
+pub mod mux_transport;
 pub mod node;
 pub mod obfs;
 pub mod permissions;
@@ -63,6 +64,10 @@ pub use http2_transport::{Http2Connector, Http2Handler, Http2Transporter};
 pub use http_proxy::{HttpConnector, HttpHandler};
 pub use kcp::{KcpConfig, KcpTransporter};
 pub use mux::{MuxFrame, MuxSession};
+pub use mux_transport::{
+    mux_config_from_node, mux_config_from_values, MuxDialer, MuxDialerPool, MuxHandler, MuxServer,
+    MuxStreamConn, SessionCount,
+};
 pub use node::{Node, NodeGroup, ParseNodeError};
 pub use obfs::{Obfs4Transporter, ObfsHttpTransporter, ObfsTlsTransporter};
 pub use permissions::{Can, Permissions, PortRange};
@@ -76,7 +81,7 @@ pub use selector::{FifoStrategy, Filter, NodeSelector, RandomStrategy, RoundStra
 pub use server::Server;
 pub use sni::SniHandler;
 pub use socks4::{Socks4Connector, Socks4Handler, Socks4aConnector};
-pub use socks5::{Socks5Connector, Socks5Handler};
+pub use socks5::{Socks5Connector, Socks5Handler, Socks5UdpTunnelConn};
 pub use ss::{
     ShadowConnector, ShadowHandler, ShadowUdpConnector, ShadowUdpHandler, SsCipher, SsStream,
 };

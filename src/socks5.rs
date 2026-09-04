@@ -1,8 +1,11 @@
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
@@ -21,9 +24,22 @@ const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 const CMD_CONNECT: u8 = 0x01;
 const CMD_BIND: u8 = 0x02;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
+/// gost's private SOCKS5 command for tunnelling UDP datagrams over the TCP
+/// control connection (`CmdUDPTun`, socks.go:37).
+const CMD_UDP_TUN: u8 = 0xF3;
 
 /// Maximum size of a single UDP datagram we are willing to relay.
 const UDP_BUFFER_SIZE: usize = 64 * 1024;
+
+/// The largest payload one tunnelled datagram can carry: its length travels in
+/// the 2-byte RSV field, so it cannot exceed a `u16`.
+const UDP_TUN_MAX_PAYLOAD: usize = u16::MAX as usize;
+
+/// How many bytes of a tunnel frame can be read before its total length is
+/// known: RSV(2) | FRAG(1) | ATYP(1) plus one more byte, which is either the
+/// first address byte or, for a domain, the name's length. gost reads exactly
+/// these five first (gosocks5 v0.3.0 socks5.go:676).
+const UDP_TUN_HEAD_LEN: usize = 5;
 
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
@@ -37,6 +53,408 @@ const REP_HOST_UNREACHABLE: u8 = 0x04;
 const REP_CONNECTION_REFUSED: u8 = 0x05;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDR_NOT_SUPPORTED: u8 = 0x08;
+
+// ---------------------------------------------------------------------------
+// SOCKS5 UDP-over-TCP tunnel framing (gost's CmdUDPTun, socks.go:37)
+// ---------------------------------------------------------------------------
+//
+// The tunnel carries ordinary SOCKS5 UDP datagrams over a byte stream:
+//
+//     +-----+------+------+----------+----------+----------+
+//     | RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+//     +-----+------+------+----------+----------+----------+
+//     |  2  |  1   |  1   | Variable |    2     | Variable |
+//     +-----+------+------+----------+----------+----------+
+//
+// There is no separate length prefix. TCP's missing message boundaries are
+// recovered by *repurposing the 2-byte RSV field as the length of DATA*,
+// big-endian, covering the payload only and not the header. gosocks5 v0.3.0
+// calls this out in so many words:
+//
+//     dlen := int(header.Rsv)
+//     if dlen == 0 { // standard SOCKS5 UDP datagram
+//         ...
+//     } else { // extended feature, for UDP over TCP, using reserved field as data length
+//         if _, err := io.ReadFull(r, b[n:hlen+dlen]); err != nil { ... }
+//     }
+//                                             -- gosocks5 socks5.go:693-706
+//
+// and both ends of gost's tunnel stamp it on every write:
+//
+//     dgram := gosocks5.NewUDPDatagram(
+//         gosocks5.NewUDPHeader(uint16(n), 0, toSocksAddr(addr)), b[:n])
+//                                             -- gost socks.go:1478-1479 (server)
+//     dgram := gosocks5.NewUDPDatagram(
+//         gosocks5.NewUDPHeader(uint16(len(b)), 0, toSocksAddr(addr)), b)
+//                                             -- gost socks.go:1968 (client)
+//
+// The reader therefore takes the frame length from the header alone:
+// `hlen` is 10 for IPv4, 22 for IPv6 and `7 + len(domain)` for a name
+// (gosocks5 socks5.go:686-694), and the whole frame is `hlen + dlen` bytes.
+//
+// One deliberate deviation: gost's reader treats `RSV == 0` as "this is a
+// plain packet-conn datagram" and calls `ioutil.ReadAll`, which on a stream
+// swallows every following frame. gost's writers only ever produce `RSV == 0`
+// for a zero-length payload, so this port reads such a frame as an empty
+// datagram and drops it, exactly as `RelayConn` drops empty relay datagrams
+// (relay.rs:314-319). That keeps the stream in sync where gost would desync,
+// and produces identical bytes on the wire.
+
+/// Read-side state machine for [`Socks5UdpTunnelConn`].
+enum TunnelReadState {
+    /// Waiting for the fixed five-byte prefix that reveals the frame length.
+    Head,
+    /// Waiting for the rest of the frame: `(header length, data length)`.
+    Body(usize, usize),
+    /// The peer closed the stream on a frame boundary.
+    Eof,
+}
+
+/// Wraps a byte stream in gost's SOCKS5 UDP-over-TCP datagram framing.
+///
+/// gost's `socks5UDPTunnelConn` (socks.go:1905-1974) is both a `net.Conn` and
+/// a `net.PacketConn`; this type offers the same two views. [`recv_from`] and
+/// [`send_to`] carry the per-datagram address, while the `AsyncRead` /
+/// `AsyncWrite` impls hide it: reads yield payloads only, and writes are
+/// stamped with the fixed destination `taddr` the connection was built with,
+/// mirroring gost's `Read`/`Write` (socks.go:1948-1968).
+///
+/// [`recv_from`]: Socks5UdpTunnelConn::recv_from
+/// [`send_to`]: Socks5UdpTunnelConn::send_to
+pub struct Socks5UdpTunnelConn<S> {
+    inner: S,
+    /// Destination stamped on datagrams written through `AsyncWrite`. gost's
+    /// `toSocksAddr(nil)` is `0.0.0.0:0` (socks.go:1634-1651), which is what a
+    /// tunnel opened without one uses.
+    taddr: (String, u16),
+    /// Address the server reported in its reply; client side only.
+    bound_addr: Option<String>,
+
+    read_state: TunnelReadState,
+    read_buf: Vec<u8>,
+    read_need: usize,
+    /// One fully received datagram, held across `poll_read` calls so that a
+    /// datagram larger than the caller's buffer is delivered in full rather
+    /// than truncated, and so that two datagrams are never coalesced.
+    plain: Vec<u8>,
+    plain_pos: usize,
+    /// Source address of `plain`.
+    plain_host: String,
+    plain_port: u16,
+
+    out: Vec<u8>,
+    out_pos: usize,
+}
+
+impl<S> Socks5UdpTunnelConn<S> {
+    /// Server side: every datagram carries its own address, so there is no
+    /// default destination.
+    pub fn server(inner: S) -> Self {
+        Self::with_taddr(inner, ("0.0.0.0".to_string(), 0), None)
+    }
+
+    /// Client side. `taddr` is stamped on datagrams written through
+    /// `AsyncWrite`; `bound_addr` is the address the server reported.
+    pub fn client(inner: S, taddr: (String, u16), bound_addr: String) -> Self {
+        Self::with_taddr(inner, taddr, Some(bound_addr))
+    }
+
+    fn with_taddr(inner: S, taddr: (String, u16), bound_addr: Option<String>) -> Self {
+        Self {
+            inner,
+            taddr,
+            bound_addr,
+            read_state: TunnelReadState::Head,
+            read_buf: Vec::with_capacity(UDP_TUN_HEAD_LEN),
+            read_need: UDP_TUN_HEAD_LEN,
+            plain: Vec::new(),
+            plain_pos: 0,
+            plain_host: String::new(),
+            plain_port: 0,
+            out: Vec::new(),
+            out_pos: 0,
+        }
+    }
+
+    /// The address the server bound for this tunnel, as reported in its reply.
+    pub fn bound_addr(&self) -> Option<&str> {
+        self.bound_addr.as_deref()
+    }
+
+    /// Queues one datagram for transmission.
+    fn queue_datagram(&mut self, host: &str, port: u16, data: &[u8]) -> io::Result<()> {
+        if data.len() > UDP_TUN_MAX_PAYLOAD {
+            return Err(io::Error::other(format!(
+                "socks5: datagram of {} bytes exceeds the {}-byte tunnel maximum",
+                data.len(),
+                UDP_TUN_MAX_PAYLOAD
+            )));
+        }
+        encode_udp_tunnel_datagram_into(host, port, data, &mut self.out);
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Unpin> Socks5UdpTunnelConn<S> {
+    /// Reads until `read_buf` holds `read_need` bytes. `Ok(false)` means the
+    /// peer closed the stream before that many arrived.
+    fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        while self.read_buf.len() < self.read_need {
+            let start = self.read_buf.len();
+            self.read_buf.resize(self.read_need, 0);
+            let mut rb = ReadBuf::new(&mut self.read_buf[start..]);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
+                Poll::Pending => {
+                    self.read_buf.truncate(start);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => {
+                    self.read_buf.truncate(start);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    self.read_buf.truncate(start + n);
+                    if n == 0 {
+                        return Poll::Ready(Ok(false));
+                    }
+                }
+            }
+        }
+        Poll::Ready(Ok(true))
+    }
+
+    /// Advances the read state machine until `plain` holds one whole datagram.
+    /// `Ok(false)` means the stream ended cleanly on a frame boundary.
+    fn poll_datagram(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        loop {
+            if self.plain_pos < self.plain.len() {
+                return Poll::Ready(Ok(true));
+            }
+            self.plain.clear();
+            self.plain_pos = 0;
+
+            if matches!(self.read_state, TunnelReadState::Eof) {
+                return Poll::Ready(Ok(false));
+            }
+
+            let complete = match self.poll_fill(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(c)) => c,
+            };
+            if !complete {
+                // A close on a frame boundary is a normal end of stream;
+                // part-way through a frame it is a truncated one.
+                if self.read_buf.is_empty() && matches!(self.read_state, TunnelReadState::Head) {
+                    self.read_state = TunnelReadState::Eof;
+                    return Poll::Ready(Ok(false));
+                }
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "socks5: truncated UDP tunnel datagram",
+                )));
+            }
+
+            match self.read_state {
+                TunnelReadState::Head => {
+                    let b = &self.read_buf;
+                    // RSV doubles as the payload length (gosocks5 socks5.go:693).
+                    let dlen = u16::from_be_bytes([b[0], b[1]]) as usize;
+                    // gosocks5 socks5.go:686-694.
+                    let hlen = match b[3] {
+                        ATYP_IPV4 => 10,
+                        ATYP_IPV6 => 22,
+                        ATYP_DOMAIN => 7 + b[4] as usize,
+                        other => {
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "socks5: bad address type in UDP tunnel frame: {}",
+                                other
+                            ))))
+                        }
+                    };
+                    self.read_state = TunnelReadState::Body(hlen, dlen);
+                    self.read_need = hlen + dlen;
+                }
+                TunnelReadState::Body(hlen, dlen) => {
+                    let frame = std::mem::take(&mut self.read_buf);
+                    self.read_state = TunnelReadState::Head;
+                    self.read_need = UDP_TUN_HEAD_LEN;
+
+                    // The header is a plain SOCKS5 UDP header, so the datagram
+                    // parser the ASSOCIATE relay uses decodes it verbatim.
+                    let (frag, host, port, off) = match parse_udp_datagram(&frame[..hlen]) {
+                        Some(v) => v,
+                        None => {
+                            return Poll::Ready(Err(io::Error::other(
+                                "socks5: malformed address in UDP tunnel frame",
+                            )))
+                        }
+                    };
+                    debug_assert_eq!(off, hlen);
+
+                    // Neither gost nor this port reassembles fragments.
+                    if frag != 0 {
+                        debug!("[socks5-udp-tun] dropping fragment (frag={})", frag);
+                        continue;
+                    }
+
+                    self.plain_host = host;
+                    self.plain_port = port;
+                    self.plain = frame[hlen..hlen + dlen].to_vec();
+                    self.plain_pos = 0;
+                }
+                TunnelReadState::Eof => unreachable!("handled above"),
+            }
+        }
+    }
+
+    fn poll_recv_from(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<(Vec<u8>, String, u16)>>> {
+        match self.poll_datagram(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(false)) => Poll::Ready(Ok(None)),
+            Poll::Ready(Ok(true)) => {
+                let data = self.plain[self.plain_pos..].to_vec();
+                self.plain.clear();
+                self.plain_pos = 0;
+                Poll::Ready(Ok(Some((data, self.plain_host.clone(), self.plain_port))))
+            }
+        }
+    }
+
+    /// Receives the next datagram as `(payload, host, port)`. `Ok(None)` is a
+    /// clean end of stream. Cancel-safe: every byte of a partially received
+    /// frame stays in the connection, so dropping the future loses nothing.
+    pub async fn recv_from(&mut self) -> io::Result<Option<(Vec<u8>, String, u16)>> {
+        std::future::poll_fn(|cx| self.poll_recv_from(cx)).await
+    }
+}
+
+impl<S: AsyncWrite + Unpin> Socks5UdpTunnelConn<S> {
+    fn poll_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.out_pos < self.out.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.out[self.out_pos..]) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(n)) => self.out_pos += n,
+            }
+        }
+        self.out.clear();
+        self.out_pos = 0;
+        Poll::Ready(Ok(()))
+    }
+
+    /// Sends one datagram addressed to `host:port`.
+    pub async fn send_to(&mut self, data: &[u8], host: &str, port: u16) -> io::Result<()> {
+        // Drain what is already queued before adding more, so a slow peer
+        // cannot make the outbound buffer grow without bound.
+        std::future::poll_fn(|cx| self.poll_flush_out(cx)).await?;
+        self.queue_datagram(host, port, data)?;
+        std::future::poll_fn(|cx| self.poll_flush_out(cx)).await
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Socks5UdpTunnelConn<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+
+        loop {
+            // Hand back the datagram already in hand before pulling another,
+            // so a single read never spans two datagrams.
+            if me.plain_pos < me.plain.len() {
+                let n = buf.remaining().min(me.plain.len() - me.plain_pos);
+                buf.put_slice(&me.plain[me.plain_pos..me.plain_pos + n]);
+                me.plain_pos += n;
+                if me.plain_pos == me.plain.len() {
+                    me.plain.clear();
+                    me.plain_pos = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            match me.poll_datagram(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(true)) => {}
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Socks5UdpTunnelConn<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Bound memory by draining the previous frame before queueing another.
+        match me.poll_flush_out(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+
+        let (host, port) = me.taddr.clone();
+        me.queue_datagram(&host, port, buf)?;
+
+        // Best-effort flush; whatever remains goes out on the next call.
+        let _ = me.poll_flush_out(cx);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        match me.poll_flush_out(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => Pin::new(&mut me.inner).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        match me.poll_flush_out(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+        Pin::new(&mut me.inner).poll_shutdown(cx)
+    }
+}
+
+/// Appends one UDP-over-TCP tunnel frame to `buf`.
+///
+/// `RSV` is the payload length, big-endian, covering `DATA` only; `FRAG` is
+/// always 0. gost: `UDPHeader.Write` + `UDPDatagram.Write`
+/// (gosocks5 v0.3.0 socks5.go:633-647 and 726-741).
+fn encode_udp_tunnel_datagram_into(host: &str, port: u16, data: &[u8], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(data.len() as u16).to_be_bytes()); // RSV = len(DATA)
+    buf.push(0x00); // FRAG
+    encode_address(host, port, buf); // ATYP | DST.ADDR | DST.PORT
+    buf.extend_from_slice(data);
+}
+
+/// Convenience wrapper around [`encode_udp_tunnel_datagram_into`].
+fn encode_udp_tunnel_datagram(host: &str, port: u16, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(data.len() + 3 + 1 + host.len().max(16) + 2);
+    encode_udp_tunnel_datagram_into(host, port, data, &mut buf);
+    buf
+}
 
 /// SOCKS5 connector (client side).
 pub struct Socks5Connector {
@@ -115,6 +533,60 @@ impl Socks5Connector {
         skip_address(&mut conn, reply[3]).await?;
 
         Ok(conn)
+    }
+
+    /// Opens a UDP-over-TCP tunnel over `conn` and returns the datagram view
+    /// of it.
+    ///
+    /// gost: `newSocks5UDPTunnelConn` (socks.go:1910-1946), reached through
+    /// `getSocks5UDPTunnel` (socks.go:1887-1903). `bind_addr` is the address
+    /// the server should bind its UDP socket on, which travels in the request;
+    /// `target` is the fixed destination for the `AsyncWrite` view and may be
+    /// omitted when every datagram carries its own (gost passes `nil`).
+    ///
+    /// Generic over the stream so a chain hop can hand in whatever it dialled:
+    /// `Chain::dial` is TCP-only today, but a `ProxyConn` works just as well.
+    pub async fn udp_tunnel<S>(
+        &self,
+        mut conn: S,
+        bind_addr: &str,
+        target: Option<&str>,
+    ) -> Result<Socks5UdpTunnelConn<S>, HandlerError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        socks5_method_handshake(&mut conn, self.user.as_ref()).await?;
+
+        // VER | CMD=0xF3 | RSV | ATYP | ADDR | PORT (gosocks5 socks5.go:487-506)
+        let (host, port) = parse_address(bind_addr)?;
+        let mut req = vec![SOCKS5_VERSION, CMD_UDP_TUN, 0x00];
+        encode_address(&host, port, &mut req);
+        conn.write_all(&req).await?;
+
+        let mut head = [0u8; 4];
+        conn.read_exact(&mut head).await?;
+        if head[0] != SOCKS5_VERSION {
+            return Err(HandlerError::Proxy("invalid SOCKS5 version".into()));
+        }
+        if head[1] != REP_SUCCESS {
+            return Err(HandlerError::Proxy(format!(
+                "socks5 UDP tunnel failure: code {}",
+                head[1]
+            )));
+        }
+        let (bhost, bport) = read_address(&mut conn, head[3]).await?;
+
+        // gost's `toSocksAddr(nil)` is 0.0.0.0:0 (socks.go:1634-1651).
+        let taddr = match target {
+            Some(t) => parse_address(t)?,
+            None => ("0.0.0.0".to_string(), 0),
+        };
+
+        Ok(Socks5UdpTunnelConn::client(
+            conn,
+            taddr,
+            join_host_port(&bhost, bport),
+        ))
     }
 }
 
@@ -383,6 +855,189 @@ impl Socks5Handler {
         Ok(())
     }
 
+    /// gost: socks5Handler.handleUDPTunnel (socks.go:1397-1455).
+    ///
+    /// The datagrams ride the TCP control connection itself instead of a
+    /// side-channel UDP socket, which is what lets UDP cross a proxy chain at
+    /// all: `Chain::dial` only ever produces a stream.
+    async fn handle_udp_tunnel(
+        &self,
+        mut conn: ProxyConn,
+        target: &str,
+        peer_addr: &str,
+    ) -> Result<(), HandlerError> {
+        let chain = self.options.chain.clone().unwrap_or_default();
+
+        if !chain.is_empty() {
+            // Chain forward (socks.go:1431-1454): replay the request onto the
+            // last node and splice, so a tunnel can be relayed hop by hop.
+            // gost deliberately does not re-authorize a forwarded tunnel: the
+            // forwarding is configured server-side, which is as explicit as
+            // whitelisting (socks.go:1445-1447).
+            let node = chain.last_node();
+            let cc =
+                tokio::time::timeout(self.dial_timeout(), TcpStream::connect(&node.addr)).await;
+            let mut cc = match cc {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    send_reply(&mut conn, REP_GENERAL_FAILURE, "0.0.0.0", 0).await?;
+                    return Err(HandlerError::Io(e));
+                }
+                Err(_) => {
+                    send_reply(&mut conn, REP_GENERAL_FAILURE, "0.0.0.0", 0).await?;
+                    return Err(HandlerError::Proxy("udp-tun: chain dial timeout".into()));
+                }
+            };
+
+            if let Err(e) = socks5_method_handshake(&mut cc, node.user.as_ref()).await {
+                send_reply(&mut conn, REP_GENERAL_FAILURE, "0.0.0.0", 0).await?;
+                return Err(e);
+            }
+
+            let (host, port) = parse_address(target)?;
+            let mut req = vec![SOCKS5_VERSION, CMD_UDP_TUN, 0x00];
+            encode_address(&host, port, &mut req);
+            cc.write_all(&req).await?;
+
+            info!("[socks5-udp-tun] {} <-> {}", peer_addr, node.addr);
+            transport(conn, cc).await.ok();
+            info!("[socks5-udp-tun] {} >-< {}", peer_addr, node.addr);
+            return Ok(());
+        }
+
+        // gost gates the bind address with the "rudp" action (socks.go:1402)
+        // and then simply drops the connection. Replying NOT_ALLOWED first is
+        // strictly more informative and is what every other refusal in this
+        // handler does.
+        if !Can(
+            "rudp",
+            target,
+            self.options.whitelist.as_ref(),
+            self.options.blacklist.as_ref(),
+        ) {
+            warn!(
+                "[socks5-udp-tun] {} - unauthorized to udp bind to {}",
+                peer_addr, target
+            );
+            send_reply(&mut conn, REP_NOT_ALLOWED, "0.0.0.0", 0).await?;
+            return Err(HandlerError::Forbidden);
+        }
+
+        // gost resolves the requested bind address and hands it to ListenUDP;
+        // an address it cannot resolve becomes nil, i.e. a wildcard bind on an
+        // ephemeral port (socks.go:1406-1407).
+        let (bind_host, bind_port) = parse_address(target)?;
+        let bind_sa = resolve_udp_addr(&bind_host, bind_port)
+            .await
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+
+        let uc = match UdpSocket::bind(bind_sa).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("[socks5-udp-tun] {} -> {} : {}", peer_addr, target, e);
+                send_reply(&mut conn, REP_GENERAL_FAILURE, "0.0.0.0", 0).await?;
+                return Err(HandlerError::Io(e));
+            }
+        };
+        let bound = uc.local_addr()?;
+
+        // gost advertises the UDP socket's port under the control connection's
+        // local IP (socks.go:1414-1415), so a wildcard bind still reports an
+        // address the client can actually reach.
+        let advertised_ip = conn.local_addr().map(|a| a.ip()).unwrap_or(bound.ip());
+        send_reply(
+            &mut conn,
+            REP_SUCCESS,
+            &advertised_ip.to_string(),
+            bound.port(),
+        )
+        .await?;
+
+        info!(
+            "[socks5-udp-tun] {} <-> {} : tunnel bound on {}",
+            peer_addr,
+            target,
+            join_host_port(&advertised_ip.to_string(), bound.port())
+        );
+
+        let mut tunnel = Socks5UdpTunnelConn::server(conn);
+        if let Err(e) = self.tunnel_server_udp(&mut tunnel, &uc).await {
+            debug!("[socks5-udp-tun] {} - relay: {}", peer_addr, e);
+        }
+
+        info!("[socks5-udp-tun] {} >-< {} : tunnel closed", peer_addr, target);
+        Ok(())
+    }
+
+    /// gost: socks5Handler.tunnelServerUDP (socks.go:1457-1524).
+    ///
+    /// `tunnel` speaks the UDP-over-TCP framing towards the client; `pc` faces
+    /// the world and speaks plain UDP. The association lives exactly as long
+    /// as the tunnel stream: the loop ends when it closes.
+    async fn tunnel_server_udp<S>(
+        &self,
+        tunnel: &mut Socks5UdpTunnelConn<S>,
+        pc: &UdpSocket,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let mut pbuf = vec![0u8; UDP_BUFFER_SIZE];
+
+        enum Ev {
+            FromTunnel(Option<(Vec<u8>, String, u16)>),
+            FromPeer(usize, SocketAddr),
+        }
+
+        loop {
+            // The branch results are hoisted out of `select!` so the borrows
+            // on `tunnel` and `pbuf` end before we act on their contents.
+            let ev = tokio::select! {
+                r = tunnel.recv_from() => Ev::FromTunnel(r?),
+                r = pc.recv_from(&mut pbuf) => {
+                    let (n, a) = r?;
+                    Ev::FromPeer(n, a)
+                }
+            };
+
+            match ev {
+                // The client hung up; the association goes with it.
+                Ev::FromTunnel(None) => return Ok(()),
+                Ev::FromTunnel(Some((data, host, port))) => {
+                    // Filtered exactly like the ASSOCIATE relay: once as
+                    // written in the datagram, so domain rules apply, and once
+                    // after resolution, so IP/CIDR rules apply.
+                    let dst = join_host_port(&host, port);
+                    if !self.udp_dst_allowed(&dst) {
+                        continue;
+                    }
+                    let raddr = match resolve_udp_addr(&host, port).await {
+                        Some(a) => a,
+                        None => continue, // unresolvable, drop silently
+                    };
+                    let resolved = raddr.to_string();
+                    if resolved != dst && !self.udp_dst_allowed(&resolved) {
+                        continue;
+                    }
+                    pc.send_to(&data, raddr).await?;
+                }
+                Ev::FromPeer(n, raddr) => {
+                    // gost only applies the bypass on the way back
+                    // (socks.go:1476-1479), as does the ASSOCIATE relay.
+                    if let Some(ref bypass) = self.options.bypass {
+                        if bypass.contains(&raddr.to_string()) {
+                            debug!("[socks5-udp-tun] [bypass] read from {}", raddr);
+                            continue;
+                        }
+                    }
+                    tunnel
+                        .send_to(&pbuf[..n], &raddr.ip().to_string(), raddr.port())
+                        .await?;
+                }
+            }
+        }
+    }
+
     /// Whether a UDP datagram may be forwarded to `dst` ("host:port").
     ///
     /// Applies the same whitelist/blacklist and bypass rules the TCP path uses,
@@ -574,6 +1229,7 @@ impl Handler for Socks5Handler {
             CMD_CONNECT => self.handle_connect(conn, &target, &peer_addr).await,
             CMD_BIND => self.handle_bind(conn, &target, &peer_addr).await,
             CMD_UDP_ASSOCIATE => self.handle_udp_relay(conn, &target, &peer_addr).await,
+            CMD_UDP_TUN => self.handle_udp_tunnel(conn, &target, &peer_addr).await,
             _ => {
                 send_reply(&mut conn, REP_CMD_NOT_SUPPORTED, "0.0.0.0", 0).await?;
                 Err(HandlerError::Proxy(format!(
@@ -1886,6 +2542,590 @@ mod tests {
         assert!(parse_udp_datagram(&[0, 0, 0, 0x77, 1, 2, 3, 4, 0, 80]).is_none());
         // Domain with a zero length is malformed.
         assert!(parse_udp_datagram(&[0, 0, 0, ATYP_DOMAIN, 0, 0, 80]).is_none());
+    }
+
+    // ---- UDP over TCP tunnel (gost CmdUDPTun, 0xF3) ----
+    //
+    // The framing assertions below are written against hardcoded bytes taken
+    // from the gost/gosocks5 sources rather than round-tripped through this
+    // module's own encoder, because a codec that is wrong in every field still
+    // round-trips against itself perfectly.
+
+    #[test]
+    fn test_udp_tunnel_frame_bytes_ipv4() {
+        // RSV(2, big-endian) = len(DATA) | FRAG | ATYP | ADDR | PORT | DATA.
+        // gosocks5 v0.3.0 socks5.go:633-647 (UDPHeader.Write) and 726-741
+        // (UDPDatagram.Write); gost socks.go:1478-1479 and 1968 set
+        // Rsv = uint16(len(data)).
+        assert_eq!(
+            encode_udp_tunnel_datagram("1.2.3.4", 5678, b"hello"),
+            vec![
+                0x00, 0x05, // RSV = 5 = len("hello"), big-endian
+                0x00, // FRAG
+                0x01, // ATYP = IPv4
+                1, 2, 3, 4,    // DST.ADDR
+                0x16, 0x2E, // DST.PORT = 5678
+                b'h', b'e', b'l', b'l', b'o',
+            ]
+        );
+    }
+
+    #[test]
+    fn test_udp_tunnel_frame_length_is_big_endian_and_covers_data_only() {
+        let frame = encode_udp_tunnel_datagram("example.com", 53, &[0xAB; 300]);
+        // 300 = 0x012C. Big-endian puts 0x01 first; little-endian would emit
+        // 0x2C 0x01 and desync a real gost peer on the very first datagram.
+        assert_eq!(&frame[..2], &[0x01, 0x2C]);
+        // The length counts DATA only. The 18-byte header (2+1+1+1+11+2) is
+        // not included, so the frame is header + 300.
+        assert_eq!(frame.len(), 18 + 300);
+        assert_eq!(&frame[2..5], &[0x00, ATYP_DOMAIN, 11]);
+        assert_eq!(&frame[5..16], b"example.com");
+        assert_eq!(&frame[16..18], &[0x00, 0x35]);
+        assert!(frame[18..].iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn test_udp_tunnel_frame_bytes_ipv6() {
+        let mut want = vec![0x00, 0x01, 0x00, 0x04];
+        want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        want.extend_from_slice(&[0x00, 0x09, b'x']);
+        assert_eq!(encode_udp_tunnel_datagram("::1", 9, b"x"), want);
+    }
+
+    /// Bounds a read so that a framing regression shows up as a failure
+    /// rather than a hung test: a decoder that misreads the length simply
+    /// waits forever for bytes that will never come.
+    async fn soon<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), f)
+            .await
+            .expect("timed out: the UDP tunnel framing stalled the stream")
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_decodes_hardcoded_gost_frames() {
+        // Three frames written by hand in gost's wire format, back to back.
+        let mut wire: Vec<u8> = vec![
+            0x00, 0x04, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x35, b'p', b'i', b'n', b'g',
+        ];
+        wire.extend_from_slice(&[0x00, 0x02, 0x00, 0x03, 11]);
+        wire.extend_from_slice(b"example.com");
+        wire.extend_from_slice(&[0x01, 0xBB, b'o', b'k']);
+        wire.extend_from_slice(&[0x00, 0x01, 0x00, 0x04]);
+        wire.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        wire.extend_from_slice(&[0x1F, 0x90, b'z']);
+
+        let (mut a, b) = tokio::io::duplex(4096);
+        a.write_all(&wire).await.unwrap();
+        let mut conn = Socks5UdpTunnelConn::server(b);
+
+        let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
+        assert_eq!((d.as_slice(), h.as_str(), p), (&b"ping"[..], "127.0.0.1", 53));
+        let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
+        assert_eq!((d.as_slice(), h.as_str(), p), (&b"ok"[..], "example.com", 443));
+        let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
+        assert_eq!((d.as_slice(), h.as_str(), p), (&b"z"[..], "::1", 8080));
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_length_is_big_endian_on_read() {
+        // RSV = 0x0102. Read big-endian that is 258 bytes; read little-endian
+        // it would be 513, and the trailing frame would never parse.
+        let mut wire: Vec<u8> = vec![0x01, 0x02, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0x00, 0x35];
+        wire.extend_from_slice(&[0xAA; 258]);
+        wire.extend_from_slice(&[
+            0x00, 0x02, 0x00, ATYP_IPV4, 8, 8, 8, 8, 0x00, 0x35, b'o', b'k',
+        ]);
+
+        let (mut a, b) = tokio::io::duplex(4096);
+        a.write_all(&wire).await.unwrap();
+        let mut conn = Socks5UdpTunnelConn::server(b);
+
+        let (d, _, _) = soon(conn.recv_from()).await.unwrap().unwrap();
+        assert_eq!(d.len(), 258);
+        assert!(d.iter().all(|&x| x == 0xAA));
+        let (d, h, _) = soon(conn.recv_from()).await.unwrap().unwrap();
+        assert_eq!(d, b"ok");
+        assert_eq!(h, "8.8.8.8");
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_preserves_boundaries_across_tcp_reads() {
+        // Two hand-built frames, dribbled out seven bytes at a time so that
+        // every header and every payload straddles several reads.
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let mut wire: Vec<u8> = vec![0x03, 0xE8, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0x27, 0x0F];
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(&[0x00, 0x04, 0x00, ATYP_DOMAIN, 11]);
+        wire.extend_from_slice(b"example.com");
+        wire.extend_from_slice(&[0x00, 0x35, b't', b'a', b'i', b'l']);
+
+        let (mut a, b) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            for chunk in wire.chunks(7) {
+                a.write_all(chunk).await.unwrap();
+                a.flush().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let mut conn = Socks5UdpTunnelConn::server(b);
+        let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
+        assert_eq!(d, payload, "a datagram split over many reads must arrive whole");
+        assert_eq!((h.as_str(), p), ("1.2.3.4", 9999));
+
+        let (d, h, p) = soon(conn.recv_from()).await.unwrap().unwrap();
+        assert_eq!(d, b"tail", "the next datagram must not absorb the previous one");
+        assert_eq!((h.as_str(), p), ("example.com", 53));
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_async_read_never_coalesces_datagrams() {
+        // The byte-stream view still delivers one datagram per read.
+        let mut wire: Vec<u8> = vec![0x00, 0x03, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0x00, 0x35];
+        wire.extend_from_slice(b"aaa");
+        wire.extend_from_slice(&[0x00, 0x03, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0x00, 0x35]);
+        wire.extend_from_slice(b"bbb");
+
+        let (mut a, b) = tokio::io::duplex(4096);
+        a.write_all(&wire).await.unwrap();
+        let mut conn = Socks5UdpTunnelConn::server(b);
+
+        let mut buf = [0u8; 64];
+        let n = soon(conn.read(&mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"aaa");
+        let n = soon(conn.read(&mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"bbb");
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_async_write_stamps_the_fixed_destination() {
+        // gost's socks5UDPTunnelConn.Write forwards to WriteTo(b, c.taddr)
+        // (socks.go:1963-1965).
+        let (mut a, b) = tokio::io::duplex(256);
+        let mut conn =
+            Socks5UdpTunnelConn::client(b, ("1.2.3.4".to_string(), 53), "0.0.0.0:0".to_string());
+        conn.write_all(b"hi").await.unwrap();
+        conn.flush().await.unwrap();
+
+        let mut got = [0u8; 12];
+        soon(a.read_exact(&mut got)).await.unwrap();
+        assert_eq!(
+            got,
+            [0x00, 0x02, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x35, b'h', b'i']
+        );
+    }
+
+    // ---- malformed / truncated frames must be rejected, not mis-parsed ----
+
+    #[tokio::test]
+    async fn test_udp_tunnel_rejects_bad_address_type() {
+        let (mut a, b) = tokio::io::duplex(64);
+        a.write_all(&[0x00, 0x04, 0x00, 0x77, 1, 2, 3, 4, 0x00, 0x50])
+            .await
+            .unwrap();
+        let mut conn = Socks5UdpTunnelConn::server(b);
+        let err = soon(conn.recv_from()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("bad address type"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_rejects_truncated_frame() {
+        // RSV promises 8 payload bytes; only 3 arrive before the close.
+        let (mut a, b) = tokio::io::duplex(64);
+        a.write_all(&[
+            0x00, 0x08, 0x00, ATYP_IPV4, 127, 0, 0, 1, 0x00, 0x35, b'a', b'b', b'c',
+        ])
+        .await
+        .unwrap();
+        drop(a);
+
+        let mut conn = Socks5UdpTunnelConn::server(b);
+        let err = soon(conn.recv_from()).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "a short frame must be an error, not a short datagram: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_rejects_truncated_header() {
+        // Two bytes of a five-byte prefix, then the peer goes away.
+        let (mut a, b) = tokio::io::duplex(64);
+        a.write_all(&[0x00, 0x04]).await.unwrap();
+        drop(a);
+
+        let mut conn = Socks5UdpTunnelConn::server(b);
+        let err = soon(conn.recv_from()).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_rejects_empty_domain_name() {
+        let (mut a, b) = tokio::io::duplex(64);
+        a.write_all(&[0x00, 0x01, 0x00, ATYP_DOMAIN, 0x00, 0x00, 0x35, b'x'])
+            .await
+            .unwrap();
+        let mut conn = Socks5UdpTunnelConn::server(b);
+        let err = soon(conn.recv_from()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("malformed address"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_udp_tunnel_clean_eof_on_a_frame_boundary() {
+        let (a, b) = tokio::io::duplex(64);
+        drop(a);
+        let mut conn = Socks5UdpTunnelConn::server(b);
+        assert!(soon(conn.recv_from()).await.unwrap().is_none());
+    }
+
+    // ---- the client half speaks gost's request on the wire ----
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_client_sends_gost_request_bytes() {
+        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut s, _) = ln.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            s.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut req = [0u8; 10];
+            s.read_exact(&mut req).await.unwrap();
+            // VER | CmdUDPTun(0xF3) | RSV | ATYP | 127.0.0.1 | 8080
+            assert_eq!(req, [0x05, 0xF3, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90]);
+
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x22, 0xB8])
+                .await
+                .unwrap();
+            s
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let conn = Socks5Connector::new(None)
+            .udp_tunnel(stream, "127.0.0.1:8080", Some("1.2.3.4:53"))
+            .await
+            .unwrap();
+        assert_eq!(conn.bound_addr(), Some("127.0.0.1:8888"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_client_surfaces_a_refusal() {
+        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = ln.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            s.read_exact(&mut greeting).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut req = [0u8; 10];
+            s.read_exact(&mut req).await.unwrap();
+            s.write_all(&[0x05, REP_NOT_ALLOWED, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(Socks5Connector::new(None)
+            .udp_tunnel(stream, "0.0.0.0:0", None)
+            .await
+            .is_err());
+    }
+
+    // ---- end to end through the handler ----
+
+    /// Reads one tunnel frame straight off the socket, deliberately without
+    /// using this module's decoder, so the assertion cannot pass by agreeing
+    /// with the encoder under test.
+    async fn read_tunnel_frame(s: &mut TcpStream) -> (Vec<u8>, String, u16) {
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head).await.unwrap();
+        let dlen = u16::from_be_bytes([head[0], head[1]]) as usize;
+        assert_eq!(head[2], 0x00, "FRAG must be 0");
+
+        let host = match head[3] {
+            ATYP_IPV4 => {
+                let mut a = [0u8; 4];
+                s.read_exact(&mut a).await.unwrap();
+                Ipv4Addr::from(a).to_string()
+            }
+            ATYP_IPV6 => {
+                let mut a = [0u8; 16];
+                s.read_exact(&mut a).await.unwrap();
+                Ipv6Addr::from(a).to_string()
+            }
+            ATYP_DOMAIN => {
+                let mut l = [0u8; 1];
+                s.read_exact(&mut l).await.unwrap();
+                let mut d = vec![0u8; l[0] as usize];
+                s.read_exact(&mut d).await.unwrap();
+                String::from_utf8(d).unwrap()
+            }
+            other => panic!("bad ATYP on the wire: {}", other),
+        };
+
+        let mut port = [0u8; 2];
+        s.read_exact(&mut port).await.unwrap();
+        // Exactly `dlen` bytes: if RSV covered the header too, or were
+        // little-endian, this would block or over-read.
+        let mut data = vec![0u8; dlen];
+        s.read_exact(&mut data).await.unwrap();
+        (data, host, u16::from_be_bytes(port))
+    }
+
+    /// Opens a UDP tunnel with hand-written bytes and returns (conn, reply).
+    async fn open_raw_tunnel(proxy_addr: SocketAddr) -> (TcpStream, String, u16) {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        greet(&mut client).await;
+        client
+            .write_all(&[0x05, CMD_UDP_TUN, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let (rep, host, port) = read_reply(&mut client).await;
+        assert_eq!(rep, REP_SUCCESS);
+        (client, host, port)
+    }
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_end_to_end() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        spawn_udp_echo(echo);
+
+        let proxy_addr = spawn_proxy(HandlerOptions::default()).await;
+        let (mut client, host, port) = open_raw_tunnel(proxy_addr).await;
+
+        // gost advertises the UDP socket's port under the control connection's
+        // local IP (socks.go:1414-1415).
+        assert_eq!(host, "127.0.0.1");
+        assert_ne!(port, 0, "the tunnel must bind a real UDP port");
+        assert_ne!(port, proxy_addr.port());
+
+        let mut frame: Vec<u8> = vec![0x00, 0x04, 0x00, ATYP_IPV4];
+        match echo_addr.ip() {
+            IpAddr::V4(v) => frame.extend_from_slice(&v.octets()),
+            _ => panic!("expected v4"),
+        }
+        frame.extend_from_slice(&echo_addr.port().to_be_bytes());
+        frame.extend_from_slice(b"ping");
+        client.write_all(&frame).await.unwrap();
+
+        let (data, rhost, rport) = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_tunnel_frame(&mut client),
+        )
+        .await
+        .expect("timed out waiting for the tunnelled reply");
+        assert_eq!(data, b"echo:ping");
+        assert_eq!(rhost, echo_addr.ip().to_string());
+        assert_eq!(rport, echo_addr.port());
+    }
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_end_to_end_via_connector() {
+        // Same exchange, but with this crate's own client half driving it, so
+        // the connector's handshake is exercised against the real handler.
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        spawn_udp_echo(echo);
+
+        let proxy_addr = spawn_proxy(HandlerOptions::default()).await;
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut tunnel = Socks5Connector::new(None)
+            .udp_tunnel(stream, "0.0.0.0:0", None)
+            .await
+            .unwrap();
+
+        tunnel
+            .send_to(b"ping", &echo_addr.ip().to_string(), echo_addr.port())
+            .await
+            .unwrap();
+
+        let (data, host, port) =
+            tokio::time::timeout(Duration::from_secs(5), tunnel.recv_from())
+                .await
+                .expect("timed out waiting for the tunnelled reply")
+                .unwrap()
+                .unwrap();
+        assert_eq!(data, b"echo:ping");
+        assert_eq!(host, echo_addr.ip().to_string());
+        assert_eq!(port, echo_addr.port());
+    }
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_two_datagrams_in_one_write() {
+        // Both frames land in a single TCP segment; the server must split them.
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        spawn_udp_echo(echo);
+
+        let proxy_addr = spawn_proxy(HandlerOptions::default()).await;
+        let (mut client, _, _) = open_raw_tunnel(proxy_addr).await;
+
+        let ip = match echo_addr.ip() {
+            IpAddr::V4(v) => v.octets(),
+            _ => panic!("expected v4"),
+        };
+        let mut wire = Vec::new();
+        for payload in [&b"one"[..], &b"two"[..]] {
+            wire.extend_from_slice(&[0x00, payload.len() as u8, 0x00, ATYP_IPV4]);
+            wire.extend_from_slice(&ip);
+            wire.extend_from_slice(&echo_addr.port().to_be_bytes());
+            wire.extend_from_slice(payload);
+        }
+        client.write_all(&wire).await.unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (data, _, _) = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_tunnel_frame(&mut client),
+            )
+            .await
+            .expect("timed out waiting for a tunnelled reply");
+            seen.push(String::from_utf8(data).unwrap());
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["echo:one".to_string(), "echo:two".to_string()]);
+    }
+
+    // ---- per-datagram access control on the tunnel ----
+
+    /// Sends one datagram through a fresh tunnel and reports whether a reply
+    /// came back within `wait`.
+    async fn tunnel_datagram_relayed(
+        options: HandlerOptions,
+        dst: SocketAddr,
+        wait: Duration,
+    ) -> bool {
+        let proxy_addr = spawn_proxy(options).await;
+        let (mut client, _, _) = open_raw_tunnel(proxy_addr).await;
+
+        let mut frame: Vec<u8> = vec![0x00, 0x04, 0x00, ATYP_IPV4];
+        match dst.ip() {
+            IpAddr::V4(v) => frame.extend_from_slice(&v.octets()),
+            _ => panic!("expected v4"),
+        }
+        frame.extend_from_slice(&dst.port().to_be_bytes());
+        frame.extend_from_slice(b"ping");
+        client.write_all(&frame).await.unwrap();
+
+        tokio::time::timeout(wait, read_tunnel_frame(&mut client))
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_datagram_blocked_by_blacklist() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        spawn_udp_echo(echo);
+
+        // Positive control: with no rules the datagram is relayed, so a later
+        // absence of a reply can only be the rule doing its job.
+        assert!(
+            tunnel_datagram_relayed(HandlerOptions::default(), echo_addr, Duration::from_secs(5))
+                .await,
+            "control: an unfiltered datagram must be relayed through the tunnel"
+        );
+
+        // "udp:127.0.0.1:*" does not cover the 0.0.0.0:0 bind address in the
+        // request, so the tunnel is still granted and only the datagram is
+        // denied.
+        let bl = crate::permissions::Permissions::parse("udp:127.0.0.1:*").unwrap();
+        assert!(
+            !tunnel_datagram_relayed(
+                HandlerOptions {
+                    blacklist: Some(bl),
+                    ..Default::default()
+                },
+                echo_addr,
+                Duration::from_millis(600),
+            )
+            .await,
+            "Can(\"udp\", ...) must be applied to every tunnelled datagram"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_datagram_blocked_by_bypass() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        spawn_udp_echo(echo);
+
+        assert!(
+            tunnel_datagram_relayed(HandlerOptions::default(), echo_addr, Duration::from_secs(5))
+                .await,
+            "control: an unfiltered datagram must be relayed through the tunnel"
+        );
+
+        let bypass = std::sync::Arc::new(crate::bypass::Bypass::from_patterns(
+            false,
+            &["127.0.0.1"],
+        ));
+        assert!(
+            !tunnel_datagram_relayed(
+                HandlerOptions {
+                    bypass: Some(bypass),
+                    ..Default::default()
+                },
+                echo_addr,
+                Duration::from_millis(600),
+            )
+            .await,
+            "the bypass must be applied per tunnelled datagram"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_bind_denied_by_blacklist() {
+        // gost gates the requested bind address with the "rudp" action
+        // (socks.go:1402).
+        let bl = crate::permissions::Permissions::parse("rudp:*:*").unwrap();
+        let proxy_addr = spawn_proxy(HandlerOptions {
+            blacklist: Some(bl),
+            ..Default::default()
+        })
+        .await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        greet(&mut client).await;
+        client
+            .write_all(&[0x05, CMD_UDP_TUN, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let (rep, _, _) = read_reply(&mut client).await;
+        assert_eq!(rep, REP_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn test_socks5_udp_tunnel_socket_dies_with_the_stream() {
+        let proxy_addr = spawn_proxy(HandlerOptions::default()).await;
+        let (client, host, port) = open_raw_tunnel(proxy_addr).await;
+        let bound: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
+
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            UdpSocket::bind(bound).await.is_ok(),
+            "the tunnel's UDP socket must be closed when the stream closes"
+        );
     }
 
     #[tokio::test]

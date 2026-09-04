@@ -345,7 +345,7 @@ fn load_secrets_file(path: &str) -> Result<LocalAuthenticator, std::io::Error> {
 /// between a listener and the handler dispatch, so accepting them would serve
 /// plaintext TCP under an encrypted-looking scheme.
 const SUPPORTED_LISTENER_TRANSPORTS: &[&str] = &[
-    "tcp", "tls", "ws", "wss", "udp", "rtcp", "rudp", "dns", "redu",
+    "tcp", "tls", "ws", "wss", "mtls", "mws", "mwss", "udp", "rtcp", "rudp", "dns", "redu",
 ];
 
 fn ensure_listener_transport_supported(
@@ -492,6 +492,35 @@ async fn run_server(
         "tls" => {
             let config = tls_server_config(&node)?;
             let server = TlsServer::new(&addr, config, handler).await?;
+            let server_cancel = server.cancel_token();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                cancel_clone.cancelled().await;
+                server_cancel.cancel();
+            });
+            server.serve().await
+        }
+        // The multiplexed variants: one accepted connection becomes an smux
+        // session, and every stream on it is dispatched to the handler.
+        "mtls" | "mws" | "mwss" => {
+            let mux = mux_transport::mux_config_from_node(&node)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let server = match node.transport.as_str() {
+                "mtls" => {
+                    MuxServer::new_mtls(&addr, tls_server_config(&node)?, mux, handler).await?
+                }
+                "mwss" => {
+                    MuxServer::new_mwss(
+                        &addr,
+                        ws_options(&node),
+                        tls_server_config(&node)?,
+                        mux,
+                        handler,
+                    )
+                    .await?
+                }
+                _ => MuxServer::new_mws(&addr, ws_options(&node), mux, handler).await?,
+            };
             let server_cancel = server.cancel_token();
             let cancel_clone = cancel.clone();
             tokio::spawn(async move {

@@ -1410,7 +1410,8 @@ making them cross-implementation rather than self-consistent.
 | SOCKS5 CONNECT | Working | User/pass auth, IPv4/IPv6/domain, all-zero bound address in the reply |
 | SOCKS5 UDP ASSOCIATE | Working | Real relay socket, per-datagram ACL, fragments dropped, torn down with the control connection |
 | SOCKS5 BIND | Working | Two-reply sequence |
-| SOCKS5 gost extensions | Absent | MethodTLS 0x80, MethodTLSAuth 0x82, CmdMuxBind 0xF2, CmdUDPTun 0xF3 |
+| SOCKS5 `CmdUDPTun` (0xF3) | Working (server) | UDP over the TCP control connection, with the length carried in the repurposed `RSV` field as gost does. Client side exists; not yet wired to a chain hop |
+| SOCKS5 other gost extensions | Absent | MethodTLS 0x80, MethodTLSAuth 0x82, CmdMuxBind 0xF2 |
 | SOCKS4/4a proxy | Working | CONNECT and BIND |
 | Auto-detect handler | Working | Refuses SOCKS4 when credentials are configured, as gost does |
 | Proxy chain (multi-hop) | Partial | HTTP/SOCKS4/SOCKS4a/SOCKS5 connectors with authentication; unknown protocols are a hard error. No transport layer mid-chain |
@@ -1436,14 +1437,14 @@ making them cross-implementation rather than self-consistent.
 | TLS transport (chain / `-F`) | Working | `-F http+tls://proxy:443` layers TLS then speaks the hop's protocol inside it; `?secure=true` enables verification, off by default as in gost |
 | mTLS transport | Absent | Needs smux |
 | WS / WSS transport | Working | Listener and chain hop; default path `/ws` as in gost. `?compression=`/`?rbuf=` parse but have no effect (tungstenite has no equivalent) |
-| MWS / MWSS transport | Absent | Need smux |
+| MTLS / MWS / MWSS transport | Working (listener) | One accepted connection becomes an smux session; every stream is a separate handler invocation. Chain-side dialer exists (`MuxDialer`, session reuse) but is not yet wired to `-F` |
 | KCP transport | Types only | Config parsing only; no KCP crate |
 | QUIC transport | Types only | quinn present but no accept loop and no ALPN |
 | HTTP/2, h2, h2c transport | Types only | The `http2` handler falls back to HTTP/1.1, which gost cannot speak |
 | Obfuscation (ohttp / otls) | Types only | Handshake only; otls has no record framing |
 | Obfuscation (obfs4) | Absent | Dropped in go-gost v3 as well |
 | SSH tunnelling | Types only | Rejected at startup; russh is not wired |
-| Multiplexing (smux) | Working (v1) | Wire-verified against xtaci/smux v1.5.24: 8-byte little-endian header, keepalive, session-wide receive credit. v2 (`?smuxver=2`) is rejected rather than silently misbehaving. Not yet wired to `mtls`/`mws`/`mwss` |
+| Multiplexing (smux) | Working (v1) | Wire-verified against xtaci/smux v1.5.24: 8-byte little-endian header, keepalive, session-wide receive credit. v2 (`?smuxver=2`) is rejected rather than silently misbehaving |
 | TUN / TAP | Types only | Configures an existing interface; no device creation or packet loop |
 | FakeTCP, VSOCK | Types only | Need raw sockets and a vsock crate |
 | Socket mark / interface bind | Working on Linux | `-M` / `-I` applied to outbound sockets before connect; no-op elsewhere |
