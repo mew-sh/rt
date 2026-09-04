@@ -50,7 +50,7 @@ and FreeBSD (`x86_64`), on the
 [releases page](https://github.com/mew-sh/rt/releases).
 
 ```bash
-VERSION=v2.0.0
+VERSION=v2.1.0
 TARGET=x86_64-unknown-linux-gnu
 curl -fsSLO https://github.com/mew-sh/rt/releases/download/$VERSION/rt-$VERSION-$TARGET.tar.gz
 curl -fsSLO https://github.com/mew-sh/rt/releases/download/$VERSION/SHA256SUMS.txt
@@ -64,10 +64,10 @@ archive in the release. Windows archives are `.zip` rather than `.tar.gz`.
 ### Docker
 
 ```bash
-docker run --rm -p 8080:8080 ghcr.io/mew-sh/rt:2.0.0 -L http://:8080
+docker run --rm -p 8080:8080 ghcr.io/mew-sh/rt:2.1.0 -L http://:8080
 ```
 
-Tags are `2.0.0`, `2.0` and `latest`.
+Tags are `2.1.0`, `2.1` and `latest`.
 
 ### From Source
 
@@ -88,7 +88,7 @@ rt -V
 Output:
 
 ```
-rt 2.0.0 (rustc windows/x86_64)
+rt 2.1.0 (rustc windows/x86_64)
 ```
 
 ---
@@ -249,7 +249,7 @@ Prints the version string and exits immediately. The output format is `rt <versi
 
 ```bash
 rt -V
-# Output: rt 2.0.0 (rustc windows/x86_64)
+# Output: rt 2.1.0 (rustc windows/x86_64)
 ```
 
 ### -P (Profiling)
@@ -1388,11 +1388,11 @@ A multi-stage `Dockerfile` and a `docker-compose.yml` are provided for container
 
 ### Pulling the Published Image
 
-Releases push an image to GitHub Container Registry, tagged `2.0.0`, `2.0` and
+Releases push an image to GitHub Container Registry, tagged `2.1.0`, `2.1` and
 `latest`:
 
 ```bash
-docker pull ghcr.io/mew-sh/rt:2.0.0
+docker pull ghcr.io/mew-sh/rt:2.1.0
 ```
 
 ### Building the Docker Image

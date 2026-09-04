@@ -101,7 +101,7 @@ pub use udp::{UdpListenConfig, UdpListener, UdpServer, UdpServerConn};
 pub use vsock_transport::{VsockAddr, VsockListener, VsockTransporter};
 pub use ws::{ws_connect_stream, WsOptions, WsServer, WsStream, DEFAULT_WS_PATH};
 
-pub const VERSION: &str = "2.0.0";
+pub const VERSION: &str = "2.1.0";
 pub const SMALL_BUFFER_SIZE: usize = 2 * 1024;
 pub const MEDIUM_BUFFER_SIZE: usize = 8 * 1024;
 pub const LARGE_BUFFER_SIZE: usize = 32 * 1024;
@@ -112,4 +112,4 @@ pub const CONNECT_TIMEOUT: u64 = 5;
 pub const READ_TIMEOUT: u64 = 10;
 pub const WRITE_TIMEOUT: u64 = 10;
 pub const DEFAULT_USER_AGENT: &str = "Chrome/78.0.3904.106";
-pub const DEFAULT_PROXY_AGENT: &str = "rt/2.0.0";
+pub const DEFAULT_PROXY_AGENT: &str = "rt/2.1.0";
