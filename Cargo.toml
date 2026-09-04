@@ -98,6 +98,12 @@ salsa20 = "0.11"
 default = []
 vendored-openssl = ["openssl"]
 
+# The test binary links every module's `#[cfg(test)]` code into one image, and
+# with full debuginfo it grew large enough that LLVM ran out of memory linking
+# it. Line tables keep panic locations, which is all the assertions need.
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 # Cross-crate inlining matters here: the hot path is a chain of thin wrappers
 # (ProxyConn -> SsStream/WsStream/MuxStream -> the socket), each a separate

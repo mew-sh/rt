@@ -71,7 +71,16 @@ impl Handler for SniHandler {
             let n = conn.peek(&mut buf).await?;
             let buf = &buf[..n];
 
-            let host = extract_sni(buf).unwrap_or_default();
+            // A gost client hides the real destination in extension 0xFFFE and
+            // leaves a decoy in the SNI, so the visible name is not necessarily
+            // where this connection is going. The rewrite strips that extension
+            // and restores the SNI, giving both the destination and the record
+            // to forward. A client that knows nothing about it still routes by
+            // its own SNI.
+            let (rewritten, host) = match rewrite_client_hello(buf, "", false) {
+                Some((record, host)) => (Some(record), host),
+                None => (None, extract_sni(buf).unwrap_or_default()),
+            };
             if host.is_empty() {
                 return Err(HandlerError::Proxy("SNI: no server name found".into()));
             }
@@ -111,10 +120,13 @@ impl Handler for SniHandler {
 
             match chain.dial(&target).await {
                 Ok(mut cc) => {
-                    // Read the actual data (not just peek) and forward it
+                    // Consume the peeked record, then forward the rewritten
+                    // one so the origin sees a ClientHello naming itself and
+                    // without gost's private extension.
                     let mut initial = vec![0u8; n];
                     conn.read_exact(&mut initial).await?;
-                    cc.write_all(&initial).await?;
+                    cc.write_all(rewritten.as_deref().unwrap_or(&initial))
+                        .await?;
 
                     info!("[sni] {} <-> {}", peer_addr, target);
                     transport(conn, cc).await.ok();
@@ -136,6 +148,205 @@ impl Handler for SniHandler {
 }
 
 /// Extract SNI (Server Name Indication) from a TLS ClientHello message.
+/// gost's private ClientHello extension carrying the real destination
+/// (sni.go:287, 305).
+const EXT_GOST_HOST: u16 = 0xFFFE;
+const EXT_SERVER_NAME: u16 = 0x0000;
+
+/// CRC32 (IEEE), which gost prefixes the encoded name with as an integrity
+/// check (sni.go:329).
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// gost's `encodeServerName` (sni.go:327-332).
+///
+/// `base64url(crc32(name) || base64url(name))`, unpadded at both levels.
+pub fn encode_server_name(name: &str) -> String {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let mut buf = crc32_ieee(name.as_bytes()).to_be_bytes().to_vec();
+    buf.extend_from_slice(engine.encode(name.as_bytes()).as_bytes());
+    engine.encode(&buf)
+}
+
+/// gost's `decodeServerName` (sni.go:334-350).
+///
+/// Returns `None` when the checksum does not match, so a corrupted or forged
+/// extension falls back to the ordinary SNI rather than redirecting the
+/// connection somewhere else.
+pub fn decode_server_name(s: &str) -> Option<String> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let outer = engine.decode(s).ok()?;
+    if outer.len() < 4 {
+        return None;
+    }
+    let inner = engine.decode(&outer[4..]).ok()?;
+    let want = u32::from_be_bytes([outer[0], outer[1], outer[2], outer[3]]);
+    if crc32_ieee(&inner) != want {
+        return None;
+    }
+    String::from_utf8(inner).ok()
+}
+
+/// Where the extensions block sits inside a ClientHello handshake body.
+///
+/// Returns `(start, end)` as offsets into `hello`, which is the handshake
+/// message including its 4-byte header.
+fn extensions_span(hello: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 4 + 2 + 32;
+    let session_len = *hello.get(i)? as usize;
+    i += 1 + session_len;
+
+    let suites_len = u16::from_be_bytes([*hello.get(i)?, *hello.get(i + 1)?]) as usize;
+    i += 2 + suites_len;
+
+    let comp_len = *hello.get(i)? as usize;
+    i += 1 + comp_len;
+
+    let exts_len = u16::from_be_bytes([*hello.get(i)?, *hello.get(i + 1)?]) as usize;
+    let start = i + 2;
+    let end = start.checked_add(exts_len)?;
+    if end > hello.len() {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Splits an extensions block into `(type, body)` pairs.
+fn parse_extensions(block: &[u8]) -> Option<Vec<(u16, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 <= block.len() {
+        let ext_type = u16::from_be_bytes([block[i], block[i + 1]]);
+        let len = u16::from_be_bytes([block[i + 2], block[i + 3]]) as usize;
+        i += 4;
+        if i + len > block.len() {
+            return None;
+        }
+        out.push((ext_type, block[i..i + len].to_vec()));
+        i += len;
+    }
+    Some(out)
+}
+
+/// Builds an SNI extension body for `name`.
+fn sni_body(name: &str) -> Vec<u8> {
+    let n = name.as_bytes();
+    let mut body = Vec::with_capacity(5 + n.len());
+    body.extend_from_slice(&((n.len() + 3) as u16).to_be_bytes());
+    body.push(0x00);
+    body.extend_from_slice(&(n.len() as u16).to_be_bytes());
+    body.extend_from_slice(n);
+    body
+}
+
+/// The host named by an SNI extension body.
+fn sni_name(body: &[u8]) -> Option<String> {
+    if body.len() < 5 {
+        return None;
+    }
+    let len = u16::from_be_bytes([body[3], body[4]]) as usize;
+    let name = body.get(5..5 + len)?;
+    String::from_utf8(name.to_vec()).ok()
+}
+
+/// Rewrites a ClientHello record the way gost's `readClientHelloRecord` does
+/// (sni.go:273-325), returning the new record and the destination host.
+///
+/// As the client, the real SNI is copied into the private extension and the
+/// visible SNI is replaced by the decoy `host`. As the server, the private
+/// extension is removed and its contents become the destination, overwriting
+/// the SNI so the origin sees the name it expects.
+pub fn rewrite_client_hello(
+    record: &[u8],
+    host: &str,
+    is_client: bool,
+) -> Option<(Vec<u8>, String)> {
+    if record.len() < 5 || record[0] != 0x16 {
+        return None;
+    }
+    let body_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    let hello = record.get(5..5 + body_len)?;
+
+    let (start, end) = extensions_span(hello)?;
+    let mut exts = parse_extensions(&hello[start..end])?;
+
+    let mut host = host.to_string();
+
+    if !is_client {
+        // Take the private extension out; whatever it names is the target.
+        let mut kept = Vec::with_capacity(exts.len());
+        for (ext_type, body) in exts {
+            if ext_type == EXT_GOST_HOST {
+                if let Some(decoded) = decode_server_name(&String::from_utf8_lossy(&body)) {
+                    host = decoded;
+                    continue;
+                }
+            }
+            kept.push((ext_type, body));
+        }
+        exts = kept;
+    }
+
+    let mut appended = None;
+    for (ext_type, body) in exts.iter_mut() {
+        if *ext_type != EXT_SERVER_NAME {
+            continue;
+        }
+        let name = sni_name(body).unwrap_or_default();
+        if host.is_empty() {
+            host = name.clone();
+        }
+        if is_client {
+            appended = Some((EXT_GOST_HOST, encode_server_name(&name).into_bytes()));
+        }
+        if !host.is_empty() {
+            *body = sni_body(&host);
+        }
+        break;
+    }
+    if let Some(ext) = appended {
+        exts.push(ext);
+    }
+
+    // Re-encode: the extension block and both enclosing lengths all move.
+    let mut block = Vec::new();
+    for (ext_type, body) in &exts {
+        block.extend_from_slice(&ext_type.to_be_bytes());
+        block.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        block.extend_from_slice(body);
+    }
+
+    let mut new_hello = Vec::with_capacity(hello.len() + block.len());
+    new_hello.extend_from_slice(&hello[..start - 2]);
+    new_hello.extend_from_slice(&(block.len() as u16).to_be_bytes());
+    new_hello.extend_from_slice(&block);
+    new_hello.extend_from_slice(&hello[end..]);
+
+    // Handshake length is a 3-byte field covering everything after it.
+    let hs_len = new_hello.len() - 4;
+    new_hello[1..4].copy_from_slice(&(hs_len as u32).to_be_bytes()[1..]);
+
+    let mut out = Vec::with_capacity(5 + new_hello.len());
+    out.extend_from_slice(&record[..3]);
+    out.extend_from_slice(&(new_hello.len() as u16).to_be_bytes());
+    out.extend_from_slice(&new_hello);
+
+    Some((out, host))
+}
+
 fn extract_sni(data: &[u8]) -> Option<String> {
     // Minimum TLS record header: 5 bytes
     if data.len() < 5 || data[0] != TLS_HANDSHAKE {
@@ -322,5 +533,118 @@ mod tests {
 
         let result = extract_sni(&data);
         assert_eq!(result, Some("example.com".to_string()));
+    }
+
+    // ---- gost's private host extension (0xFFFE) ----
+
+    #[test]
+    fn test_crc32_ieee_known_vectors() {
+        // The standard check values; gost uses Go's crc32.ChecksumIEEE.
+        assert_eq!(crc32_ieee(b""), 0x0000_0000);
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_ieee(b"example.com"), crc32_ieee(b"example.com"));
+    }
+
+    #[test]
+    fn test_server_name_encoding_roundtrip() {
+        for name in ["example.com", "a", "very.long.sub.domain.example.org"] {
+            let encoded = encode_server_name(name);
+            assert_ne!(encoded, name, "the name must not travel in clear");
+            assert_eq!(decode_server_name(&encoded).as_deref(), Some(name));
+        }
+    }
+
+    #[test]
+    fn test_decode_server_name_rejects_a_bad_checksum() {
+        let mut encoded = encode_server_name("example.com");
+        // Corrupt a byte of the inner payload; the CRC must catch it.
+        let bad = if encoded.ends_with('A') { 'B' } else { 'A' };
+        encoded.pop();
+        encoded.push(bad);
+        assert_eq!(
+            decode_server_name(&encoded),
+            None,
+            "a corrupted name must be refused, not followed"
+        );
+    }
+
+    #[test]
+    fn test_decode_server_name_rejects_short_input() {
+        assert_eq!(decode_server_name(""), None);
+        assert_eq!(decode_server_name("AAA"), None);
+    }
+
+    /// Builds a ClientHello record naming `host` in its SNI extension.
+    fn client_hello_for(host: &str) -> Vec<u8> {
+        let mut hello = Vec::new();
+        hello.extend_from_slice(&[0x03, 0x03]);
+        hello.extend_from_slice(&[0u8; 32]);
+        hello.push(0x00); // no session id
+        hello.extend_from_slice(&2u16.to_be_bytes());
+        hello.extend_from_slice(&[0x00, 0x2f]);
+        hello.push(0x01);
+        hello.push(0x00);
+
+        let body = sni_body(host);
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&EXT_SERVER_NAME.to_be_bytes());
+        exts.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&body);
+        hello.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&exts);
+
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(hello.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&hello);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn test_client_rewrite_hides_the_real_name_behind_the_decoy() {
+        let record = client_hello_for("secret.example");
+        let (rewritten, host) = rewrite_client_hello(&record, "decoy.example", true).unwrap();
+
+        assert_eq!(host, "decoy.example");
+        // The visible SNI is now the decoy, and the real name is not on the
+        // wire in clear anywhere in the record.
+        assert_eq!(extract_sni(&rewritten).as_deref(), Some("decoy.example"));
+        assert!(
+            !rewritten
+                .windows(b"secret.example".len())
+                .any(|w| w == b"secret.example"),
+            "the real name must not appear in plaintext"
+        );
+    }
+
+    #[test]
+    fn test_server_rewrite_recovers_the_real_name() {
+        let record = client_hello_for("secret.example");
+        let (from_client, _) = rewrite_client_hello(&record, "decoy.example", true).unwrap();
+
+        // The server side strips the private extension and restores the SNI.
+        let (to_origin, host) = rewrite_client_hello(&from_client, "", false).unwrap();
+        assert_eq!(host, "secret.example");
+        assert_eq!(extract_sni(&to_origin).as_deref(), Some("secret.example"));
+
+        // The private extension must not be forwarded to the origin.
+        let hello = &to_origin[5..];
+        let (start, end) = extensions_span(hello).unwrap();
+        let exts = parse_extensions(&hello[start..end]).unwrap();
+        assert!(
+            !exts.iter().any(|(t, _)| *t == EXT_GOST_HOST),
+            "the private extension must be removed before the origin sees it"
+        );
+    }
+
+    #[test]
+    fn test_server_rewrite_without_the_extension_uses_the_sni() {
+        // A plain client that knows nothing about gost still routes.
+        let record = client_hello_for("plain.example");
+        let (_, host) = rewrite_client_hello(&record, "", false).unwrap();
+        assert_eq!(host, "plain.example");
     }
 }
