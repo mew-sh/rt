@@ -65,6 +65,7 @@ use std::time::{Duration, Instant};
 
 use cipher::{Array, Block, BlockCipherEncrypt, BlockSizeUser, KeyInit};
 use rand::RngCore;
+use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
@@ -377,17 +378,19 @@ impl KcpConfig {
         Ok(())
     }
 
-    /// Says out loud what [`FecEncoder`] does not do, so an operator who asked
-    /// for erasure coding knows it is only half there. Not an error: the
-    /// framing *is* honoured, the wire format is unchanged, and KCP's own
-    /// retransmission still recovers every lost packet — just later than
-    /// parity would have.
+    /// Says out loud which half of the erasure coding is in place.
+    ///
+    /// Parity *is* generated now, so a kcp-go or gost peer can rebuild packets
+    /// this side loses on the way out. The receive half still ignores parity
+    /// shards, so losses on the way in are recovered by KCP retransmission
+    /// rather than from parity — later, but not lost. Not an error, and the
+    /// wire format is unchanged either way.
     fn warn_about_fec(&self) {
         if self.fec_overhead() != 0 {
             warn!(
-                "[kcp] datashard={}/parityshard={}: the FEC framing is on the wire but \
-                 Reed-Solomon parity is neither generated nor decoded; losses are recovered \
-                 by KCP retransmission instead",
+                "[kcp] datashard={}/parityshard={}: Reed-Solomon parity is generated for \
+                 outgoing packets, but incoming parity shards are not yet decoded; inbound \
+                 losses are recovered by KCP retransmission instead",
                 self.datashard, self.parityshard
             );
         }
@@ -870,6 +873,15 @@ struct FecEncoder {
     /// `0xffffffff / shardSize * shardSize`, so the sequence wraps on a shard
     /// boundary and the peer's grid stays aligned (fec.go:298).
     paws: u32,
+    datashard: usize,
+    parityshard: usize,
+    codec: ReedSolomon,
+    /// Whole packets of the group so far, header included. kcp-go keeps the
+    /// same cache and encodes over a window of it (fec.go:328-331).
+    cache: Vec<Vec<u8>>,
+    /// Longest packet in the group; every shard is zero-padded to it before
+    /// encoding, because Reed-Solomon needs equal-sized shards.
+    max_size: usize,
 }
 
 impl FecEncoder {
@@ -878,9 +890,15 @@ impl FecEncoder {
             return None;
         }
         let shard_size = datashard + parityshard;
+        let codec = ReedSolomon::new(datashard as usize, parityshard as usize).ok()?;
         Some(Self {
             next: 0,
             paws: u32::MAX / shard_size * shard_size,
+            datashard: datashard as usize,
+            parityshard: parityshard as usize,
+            codec,
+            cache: Vec::with_capacity(datashard as usize),
+            max_size: 0,
         })
     }
 
@@ -894,6 +912,64 @@ impl FecEncoder {
         if self.next >= self.paws {
             self.next = 0;
         }
+    }
+
+    /// Stamps a parity header. Only the parity shard advances the sequence
+    /// past a group boundary, which is where kcp-go applies the wrap
+    /// (fec.go:382-387).
+    fn mark_parity(&mut self, header: &mut [u8]) {
+        header[0..4].copy_from_slice(&self.next.to_le_bytes());
+        header[4..6].copy_from_slice(&TYPE_PARITY.to_le_bytes());
+        self.next = (self.next + 1) % self.paws;
+    }
+
+    /// Records an outgoing data packet and, once a group is complete, returns
+    /// the parity packets for it.
+    ///
+    /// The returned packets still need their nonce, checksum and encryption:
+    /// kcp-go applies those per packet, parity included (sess.go:540-553).
+    fn push(&mut self, packet: &[u8], payload_offset: usize) -> Vec<Vec<u8>> {
+        self.max_size = self.max_size.max(packet.len());
+        self.cache.push(packet.to_vec());
+        if self.cache.len() < self.datashard {
+            return Vec::new();
+        }
+
+        let max = self.max_size;
+        // Equal-sized shards over the protected region only: the nonce and
+        // checksum are per packet and are not covered.
+        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(self.datashard + self.parityshard);
+        for packet in &self.cache {
+            let mut shard = vec![0u8; max - payload_offset];
+            let body = &packet[payload_offset..];
+            shard[..body.len()].copy_from_slice(body);
+            shards.push(shard);
+        }
+        for _ in 0..self.parityshard {
+            shards.push(vec![0u8; max - payload_offset]);
+        }
+
+        let parity = match self.codec.encode(&mut shards) {
+            Ok(()) => shards.split_off(self.datashard),
+            Err(e) => {
+                debug!("[kcp] FEC encode failed: {}", e);
+                self.cache.clear();
+                self.max_size = 0;
+                return Vec::new();
+            }
+        };
+
+        let mut out = Vec::with_capacity(self.parityshard);
+        for body in parity {
+            let mut packet = vec![0u8; max];
+            packet[payload_offset..].copy_from_slice(&body);
+            self.mark_parity(&mut packet[payload_offset - FEC_HEADER_SIZE..payload_offset]);
+            out.push(packet);
+        }
+
+        self.cache.clear();
+        self.max_size = 0;
+        out
     }
 }
 
@@ -915,6 +991,14 @@ struct PacketFramer {
 }
 
 impl PacketFramer {
+    /// Adds the per-packet nonce and checksum, then encrypts.
+    fn seal(&self, pkt: &mut [u8]) {
+        rand::thread_rng().fill_bytes(&mut pkt[..NONCE_SIZE]);
+        let checksum = crc32_ieee(&pkt[CRYPT_HEADER_SIZE..]);
+        pkt[NONCE_SIZE..CRYPT_HEADER_SIZE].copy_from_slice(&checksum.to_le_bytes());
+        self.crypt.encrypt(pkt);
+    }
+
     fn header_len(&self) -> usize {
         CRYPT_HEADER_SIZE
             + if self.fec.is_some() {
@@ -931,19 +1015,24 @@ impl io::Write for PacketFramer {
         let mut pkt = vec![0u8; header + segments.len()];
         pkt[header..].copy_from_slice(segments);
 
+        let mut parity = Vec::new();
         if let Some(fec) = &mut self.fec {
             // The size field is inside the protected region and counts itself,
             // so it is the whole shard payload: 2 + the segments.
             let payload = 2 + segments.len();
             fec.mark_data(&mut pkt[CRYPT_HEADER_SIZE..CRYPT_HEADER_SIZE + 8], payload);
+            // Parity is computed before the packet is sealed, because the
+            // nonce and checksum differ per packet and must not be covered.
+            parity = fec.push(&pkt, CRYPT_HEADER_SIZE + FEC_HEADER_SIZE);
         }
 
-        rand::thread_rng().fill_bytes(&mut pkt[..NONCE_SIZE]);
-        let checksum = crc32_ieee(&pkt[CRYPT_HEADER_SIZE..]);
-        pkt[NONCE_SIZE..CRYPT_HEADER_SIZE].copy_from_slice(&checksum.to_le_bytes());
-        self.crypt.encrypt(&mut pkt);
-
-        self.queue.lock().unwrap().push_back(pkt);
+        self.seal(&mut pkt);
+        let mut queue = self.queue.lock().unwrap();
+        queue.push_back(pkt);
+        for mut shard in parity {
+            self.seal(&mut shard);
+            queue.push_back(shard);
+        }
         Ok(segments.len())
     }
 
@@ -2987,5 +3076,167 @@ mod tests {
             .expect("serve did not return after cancellation")
             .unwrap()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fec_compat_tests {
+    use reed_solomon_erasure::galois_8::ReedSolomon;
+
+    /// Pins the Reed-Solomon matrix against klauspost/reedsolomon v1.12.0,
+    /// the library kcp-go itself uses.
+    ///
+    /// Both build a Vandermonde-derived matrix over GF(2^8), but "Reed-Solomon"
+    /// alone does not pin the construction: a different matrix produces valid
+    /// parity that a kcp-go peer cannot use. These bytes came out of a Go
+    /// program calling klauspost/reedsolomon directly, so a mismatch here means
+    /// the wire format diverges before anything else is worth testing.
+    #[test]
+    fn test_parity_matches_klauspost_reedsolomon() {
+        const DATA: usize = 4;
+        const PARITY: usize = 3;
+        const LEN: usize = 16;
+
+        let mut shards: Vec<Vec<u8>> = (0..DATA + PARITY).map(|_| vec![0u8; LEN]).collect();
+        for (i, shard) in shards.iter_mut().take(DATA).enumerate() {
+            for (j, byte) in shard.iter_mut().enumerate() {
+                *byte = (i * 31 + j * 7 + 1) as u8;
+            }
+        }
+
+        ReedSolomon::new(DATA, PARITY)
+            .unwrap()
+            .encode(&mut shards)
+            .unwrap();
+
+        assert_eq!(
+            shards[DATA],
+            vec![249, 36, 139, 210, 129, 48, 71, 227, 125, 144, 228, 173, 238, 135, 92, 181]
+        );
+        assert_eq!(
+            shards[DATA + 1],
+            vec![69, 35, 170, 233, 160, 104, 1, 239, 59, 189, 197, 150, 207, 184, 154, 89]
+        );
+        assert_eq!(
+            shards[DATA + 2],
+            vec![253, 10, 201, 176, 199, 34, 113, 53, 71, 29, 38, 79, 40, 97, 234, 99]
+        );
+    }
+
+    /// Builds a data packet the way PacketFramer does, minus the sealing.
+    fn data_packet(enc: &mut super::FecEncoder, segments: &[u8]) -> Vec<u8> {
+        let header = super::CRYPT_HEADER_SIZE + super::FEC_HEADER_SIZE_PLUS2;
+        let mut pkt = vec![0u8; header + segments.len()];
+        pkt[header..].copy_from_slice(segments);
+        enc.mark_data(
+            &mut pkt[super::CRYPT_HEADER_SIZE..super::CRYPT_HEADER_SIZE + 8],
+            2 + segments.len(),
+        );
+        pkt
+    }
+
+    #[test]
+    fn test_parity_recovers_a_lost_data_shard() {
+        // The point of the layer: lose a data packet and rebuild it from
+        // parity, without waiting for a retransmission.
+        const DATA: usize = 3;
+        const PARITY: usize = 2;
+        let payload_offset = super::CRYPT_HEADER_SIZE + super::FEC_HEADER_SIZE;
+
+        let mut enc = super::FecEncoder::new(DATA as u32, PARITY as u32).unwrap();
+
+        // Deliberately unequal lengths: that is the normal case, and the one
+        // that needs zero-padding to a common size before encoding.
+        let payloads: [&[u8]; DATA] = [b"first-segment", b"second", b"third-segment-longer"];
+        let mut packets = Vec::new();
+        let mut parity = Vec::new();
+        for p in payloads {
+            let pkt = data_packet(&mut enc, p);
+            let out = enc.push(&pkt, payload_offset);
+            packets.push(pkt);
+            if !out.is_empty() {
+                parity = out;
+            }
+        }
+
+        assert_eq!(parity.len(), PARITY, "a full group must yield parity");
+        let max = packets.iter().map(|p| p.len()).max().unwrap();
+        for shard in &parity {
+            assert_eq!(shard.len(), max, "parity is sized to the longest packet");
+            let flag = u16::from_le_bytes([
+                shard[super::CRYPT_HEADER_SIZE + 4],
+                shard[super::CRYPT_HEADER_SIZE + 5],
+            ]);
+            assert_eq!(flag, super::TYPE_PARITY);
+        }
+
+        // Rebuild the grid as a receiver would, zero-padded to one size.
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::new();
+        for pkt in &packets {
+            let mut shard = vec![0u8; max - payload_offset];
+            shard[..pkt.len() - payload_offset].copy_from_slice(&pkt[payload_offset..]);
+            shards.push(Some(shard));
+        }
+        for shard in &parity {
+            shards.push(Some(shard[payload_offset..].to_vec()));
+        }
+
+        // Lose the middle data shard.
+        let lost = 1;
+        let expected = shards[lost].clone().unwrap();
+        shards[lost] = None;
+
+        ReedSolomon::new(DATA, PARITY)
+            .unwrap()
+            .reconstruct(&mut shards)
+            .unwrap();
+
+        assert_eq!(
+            shards[lost].as_ref().unwrap(),
+            &expected,
+            "the lost shard must come back byte for byte"
+        );
+
+        // And it still declares its own length correctly.
+        let recovered = shards[lost].as_ref().unwrap();
+        let size = u16::from_le_bytes([recovered[0], recovered[1]]) as usize;
+        assert_eq!(size, 2 + payloads[lost].len());
+        assert_eq!(&recovered[2..size], payloads[lost]);
+    }
+
+    #[test]
+    fn test_sequence_numbers_run_data_then_parity() {
+        // kcp-go's grid depends on the ordering: dataShards data seqids
+        // followed by parityShards parity seqids, contiguous.
+        const DATA: usize = 2;
+        const PARITY: usize = 2;
+        let payload_offset = super::CRYPT_HEADER_SIZE + super::FEC_HEADER_SIZE;
+
+        let mut enc = super::FecEncoder::new(DATA as u32, PARITY as u32).unwrap();
+        let mut seqids = Vec::new();
+        let mut parity = Vec::new();
+        for i in 0..DATA {
+            let pkt = data_packet(&mut enc, &[i as u8; 8]);
+            seqids.push(u32::from_le_bytes([
+                pkt[super::CRYPT_HEADER_SIZE],
+                pkt[super::CRYPT_HEADER_SIZE + 1],
+                pkt[super::CRYPT_HEADER_SIZE + 2],
+                pkt[super::CRYPT_HEADER_SIZE + 3],
+            ]));
+            let out = enc.push(&pkt, payload_offset);
+            if !out.is_empty() {
+                parity = out;
+            }
+        }
+        for shard in &parity {
+            seqids.push(u32::from_le_bytes([
+                shard[super::CRYPT_HEADER_SIZE],
+                shard[super::CRYPT_HEADER_SIZE + 1],
+                shard[super::CRYPT_HEADER_SIZE + 2],
+                shard[super::CRYPT_HEADER_SIZE + 3],
+            ]));
+        }
+
+        assert_eq!(seqids, vec![0, 1, 2, 3]);
     }
 }
