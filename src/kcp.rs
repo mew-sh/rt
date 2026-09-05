@@ -378,19 +378,20 @@ impl KcpConfig {
         Ok(())
     }
 
-    /// Says out loud which half of the erasure coding is in place.
+    /// Notes the one behavioural difference from kcp-go's erasure coding.
     ///
-    /// Parity *is* generated now, so a kcp-go or gost peer can rebuild packets
-    /// this side loses on the way out. The receive half still ignores parity
-    /// shards, so losses on the way in are recovered by KCP retransmission
-    /// rather than from parity — later, but not lost. Not an error, and the
-    /// wire format is unchanged either way.
+    /// Both halves work: parity is generated on send and reconstructed on
+    /// receive. What is not implemented is kcp-go's auto-tuning, which infers
+    /// the peer's shard counts when the pattern it observes disagrees with
+    /// the configured one. Mismatched configurations therefore recover by
+    /// retransmission rather than silently re-deriving the parameters, which
+    /// would hide the misconfiguration.
     fn warn_about_fec(&self) {
         if self.fec_overhead() != 0 {
-            warn!(
-                "[kcp] datashard={}/parityshard={}: Reed-Solomon parity is generated for \
-                 outgoing packets, but incoming parity shards are not yet decoded; inbound \
-                 losses are recovered by KCP retransmission instead",
+            debug!(
+                "[kcp] datashard={}/parityshard={}: Reed-Solomon parity is generated and \
+                 decoded. Shard counts must match the peer's; they are not auto-tuned, so a \
+                 mismatch falls back to KCP retransmission",
                 self.datashard, self.parityshard
             );
         }
@@ -1030,17 +1031,11 @@ fn fec_strip(data: &[u8]) -> Option<&[u8]> {
 ///
 /// # What is missing
 ///
-/// Reed-Solomon parity shards are *not* generated. Data shards are framed and
-/// numbered exactly as kcp-go numbers them, and parity shards arriving from a
-/// peer are recognised and discarded, so the wire format is honoured in both
-/// directions — but a peer receiving from rt gets no erasure coding and
-/// falls back to KCP's own retransmission for lost packets.
-///
-/// This is visible on a kcp-go peer only as its FEC decoder detecting that the
-/// shard pattern does not match its configuration and disabling itself
-/// (fec.go:76-118); the data path is unaffected, because kcp-go feeds every
-/// data shard to the ARQ core whether or not its decoder is running
-/// (sess.go:679-683).
+/// Only kcp-go's auto-tuning (fec.go:86-118), which infers the peer's shard
+/// counts when the observed pattern disagrees with the configured one. Both
+/// shard counts must therefore match the peer's; a mismatch falls back to KCP
+/// retransmission rather than silently re-deriving the parameters, which would
+/// hide the misconfiguration.
 struct FecEncoder {
     next: u32,
     /// `0xffffffff / shardSize * shardSize`, so the sequence wraps on a shard
