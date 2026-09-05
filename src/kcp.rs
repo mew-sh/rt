@@ -837,6 +837,179 @@ fn fec_flag(data: &[u8]) -> Option<u16> {
     }
 }
 
+/// One shard held in the decoder's receive window.
+struct FecElement {
+    seqid: u32,
+    flag: u16,
+    /// The FEC payload: everything after the 6-byte header. For a data shard
+    /// that begins with its own 2-byte length.
+    data: Vec<u8>,
+    at: std::time::Instant,
+}
+
+/// Rebuilds lost data shards from parity (fec.go:53-265).
+///
+/// Shards are held in a window ordered by sequence number. A group is
+/// `datashard + parityshard` consecutive sequence numbers; once enough of a
+/// group has arrived, the missing data shards are reconstructed and returned.
+///
+/// The auto-tuning kcp-go does — inferring the peer's shard counts when the
+/// observed pattern disagrees with the configured one — is deliberately not
+/// implemented. Silently re-deriving the parameters would hide a genuine
+/// misconfiguration, and the fallback when the pattern does not match is the
+/// same either way: KCP retransmits.
+struct FecDecoder {
+    datashard: usize,
+    parityshard: usize,
+    shard_size: usize,
+    /// kcp-go keeps `rxFECMulti * shardSize` shards (fec.go:18, 63).
+    rxlimit: usize,
+    rx: Vec<FecElement>,
+    codec: ReedSolomon,
+}
+
+impl FecDecoder {
+    fn new(datashard: u32, parityshard: u32) -> Option<Self> {
+        if datashard == 0 || parityshard == 0 {
+            return None;
+        }
+        let (d, p) = (datashard as usize, parityshard as usize);
+        Some(Self {
+            datashard: d,
+            parityshard: p,
+            shard_size: d + p,
+            rxlimit: 3 * (d + p),
+            rx: Vec::new(),
+            codec: ReedSolomon::new(d, p).ok()?,
+        })
+    }
+
+    /// Feeds one shard in and returns any data shards recovered by it.
+    ///
+    /// Each returned buffer is a FEC payload: a 2-byte length followed by KCP
+    /// segments, exactly as a data shard carries them.
+    fn decode(&mut self, seqid: u32, flag: u16, data: &[u8]) -> Vec<Vec<u8>> {
+        // Ordered insertion, dropping duplicates. Sequence numbers wrap, so
+        // ordering is by signed difference rather than by value.
+        let mut insert_at = 0usize;
+        for i in (0..self.rx.len()).rev() {
+            if self.rx[i].seqid == seqid {
+                return Vec::new();
+            }
+            if seqid.wrapping_sub(self.rx[i].seqid) as i32 > 0 {
+                insert_at = i + 1;
+                break;
+            }
+        }
+        self.rx.insert(
+            insert_at,
+            FecElement {
+                seqid,
+                flag,
+                data: data.to_vec(),
+                at: std::time::Instant::now(),
+            },
+        );
+
+        let mut recovered = Vec::new();
+        let group = self.shard_size as u32;
+        let shard_begin = seqid - seqid % group;
+        let shard_end = shard_begin + group - 1;
+
+        // The group can only occupy a window of shard_size entries around the
+        // insertion point.
+        let search_begin = insert_at.saturating_sub((seqid % group) as usize);
+        let search_end = (search_begin + self.shard_size - 1).min(self.rx.len().saturating_sub(1));
+
+        if search_end >= search_begin && search_end - search_begin + 1 >= self.datashard {
+            let mut shards: Vec<Option<Vec<u8>>> = vec![None; self.shard_size];
+            let mut present = vec![false; self.shard_size];
+            let (mut num_shard, mut num_data, mut first, mut maxlen) = (0usize, 0usize, 0usize, 0);
+
+            for i in search_begin..=search_end {
+                let s = &self.rx[i];
+                if s.seqid.wrapping_sub(shard_end) as i32 > 0 {
+                    break;
+                }
+                if s.seqid.wrapping_sub(shard_begin) as i32 >= 0 {
+                    let idx = (s.seqid % group) as usize;
+                    shards[idx] = Some(s.data.clone());
+                    present[idx] = true;
+                    if num_shard == 0 {
+                        first = i;
+                    }
+                    num_shard += 1;
+                    if s.flag == TYPE_DATA {
+                        num_data += 1;
+                    }
+                    maxlen = maxlen.max(s.data.len());
+                }
+            }
+
+            if num_data == self.datashard {
+                // Nothing was lost; the group is done with.
+                self.free_range(first, num_shard);
+            } else if num_shard >= self.datashard {
+                // Reconstruction needs equal-sized shards, so every present
+                // shard is zero-padded to the longest in the group.
+                for shard in shards.iter_mut() {
+                    if let Some(buf) = shard {
+                        buf.resize(maxlen, 0);
+                    }
+                }
+                if self.codec.reconstruct_data(&mut shards).is_ok() {
+                    for (idx, was_present) in present.iter().enumerate().take(self.datashard) {
+                        if !was_present {
+                            if let Some(buf) = shards[idx].take() {
+                                recovered.push(buf);
+                            }
+                        }
+                    }
+                }
+                self.free_range(first, num_shard);
+            }
+        }
+
+        // Bound the window, and drop shards too old to complete a group.
+        if self.rx.len() > self.rxlimit {
+            self.free_range(0, 1);
+        }
+        let expiry = std::time::Duration::from_secs(60);
+        let expired = self
+            .rx
+            .iter()
+            .take_while(|e| e.at.elapsed() > expiry)
+            .count();
+        if expired > 0 {
+            self.free_range(0, expired);
+        }
+
+        recovered
+    }
+
+    fn free_range(&mut self, first: usize, n: usize) {
+        let end = (first + n).min(self.rx.len());
+        if first < end {
+            self.rx.drain(first..end);
+        }
+    }
+}
+
+/// Splits a recovered or received FEC payload into its KCP segments.
+///
+/// The payload's first two bytes are its own length, so a truncated or
+/// oversized value means the shard is not usable (sess.go:1080-1090).
+fn fec_payload_segments(payload: &[u8]) -> Option<&[u8]> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let size = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    if size < 2 || size > payload.len() {
+        return None;
+    }
+    Some(&payload[2..size])
+}
+
 /// Strips the FEC framing from a decrypted packet, leaving the KCP segments.
 ///
 /// Returns `None` for a parity shard, which carries no segments of its own.
@@ -1068,6 +1241,73 @@ fn packet_unframe(crypt: &Crypt, buf: &mut [u8]) -> Option<std::ops::Range<usize
     }
     let start = buf.len() - segments.len();
     Some(start..buf.len())
+}
+
+/// [`packet_unframe`] plus erasure recovery.
+///
+/// Returns every block of KCP segments the datagram yielded: its own, when it
+/// is a data shard, and any data shards its arrival let the decoder rebuild.
+/// A parity shard usually yields nothing and occasionally yields several.
+///
+/// With no decoder configured this is [`packet_unframe`] with the result
+/// boxed, so the non-FEC path keeps behaving identically.
+fn packet_unframe_fec(
+    crypt: &Crypt,
+    buf: &mut [u8],
+    decoder: Option<&mut FecDecoder>,
+) -> Vec<Vec<u8>> {
+    let Some(decoder) = decoder else {
+        return match packet_unframe(crypt, buf) {
+            Some(range) => vec![buf[range].to_vec()],
+            None => Vec::new(),
+        };
+    };
+
+    if buf.len() < CRYPT_HEADER_SIZE {
+        return Vec::new();
+    }
+    crypt.decrypt(buf);
+    let expected = u32::from_le_bytes([
+        buf[NONCE_SIZE],
+        buf[NONCE_SIZE + 1],
+        buf[NONCE_SIZE + 2],
+        buf[NONCE_SIZE + 3],
+    ]);
+    if crc32_ieee(&buf[CRYPT_HEADER_SIZE..]) != expected {
+        return Vec::new();
+    }
+
+    let body = &buf[CRYPT_HEADER_SIZE..];
+    let Some(flag) = fec_flag(body) else {
+        // A peer with FEC switched off; take the segments as they are.
+        return match body.len() >= IKCP_OVERHEAD {
+            true => vec![body.to_vec()],
+            false => Vec::new(),
+        };
+    };
+    if body.len() < FEC_HEADER_SIZE {
+        return Vec::new();
+    }
+    let seqid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let payload = &body[FEC_HEADER_SIZE..];
+
+    let mut out = Vec::new();
+    // The shard's own segments come first; recovery only fills gaps behind it.
+    if flag == TYPE_DATA {
+        if let Some(segments) = fec_payload_segments(payload) {
+            if segments.len() >= IKCP_OVERHEAD {
+                out.push(segments.to_vec());
+            }
+        }
+    }
+    for buf in decoder.decode(seqid, flag, payload) {
+        if let Some(segments) = fec_payload_segments(&buf) {
+            if segments.len() >= IKCP_OVERHEAD {
+                out.push(segments.to_vec());
+            }
+        }
+    }
+    out
 }
 
 /// The `conv` and `sn` of a packet's first segment, used by the listener to
@@ -1854,6 +2094,11 @@ impl KcpListener {
         let (closed_tx, mut closed_rx) = mpsc::channel::<(SocketAddr, u64)>(64);
         let mut next_id: u64 = 0;
         let mut buf = vec![0u8; MTU_LIMIT];
+        // One decoder per peer. kcp-go gives each session its own, and it has
+        // to be that way: sequence numbers are per session, so a decoder
+        // shared across peers would interleave their grids and reconstruct
+        // nonsense.
+        let mut fec: HashMap<SocketAddr, FecDecoder> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -1865,6 +2110,7 @@ impl KcpListener {
                 Some((peer, id)) = closed_rx.recv() => {
                     if peers.get(&peer).map(|s| s.id) == Some(id) {
                         peers.remove(&peer);
+                        fec.remove(&peer);
                     }
                 }
 
@@ -1882,11 +2128,18 @@ impl KcpListener {
                     };
 
                     let mut packet = buf[..n].to_vec();
-                    let range = match packet_unframe(&self.crypt, &mut packet) {
-                        Some(range) => range,
-                        None => continue,
+                    let decoder = match FecDecoder::new(
+                        self.config.datashard,
+                        self.config.parityshard,
+                    ) {
+                        Some(fresh) => Some(fec.entry(peer).or_insert(fresh)),
+                        None => None,
                     };
-                    let segments = packet[range].to_vec();
+                    let blocks = packet_unframe_fec(&self.crypt, &mut packet, decoder);
+
+                    // A parity shard carries no segments of its own but can
+                    // complete a group, so one datagram may yield several.
+                    for segments in blocks {
                     let (conv, sn) = match peek_conv(&segments) {
                         Some(v) => v,
                         None => continue,
@@ -1954,6 +2207,7 @@ impl KcpListener {
                         }
                         let _ = closed.send((peer, id)).await;
                     });
+                    }
                 }
             }
         }
@@ -2105,6 +2359,10 @@ pub async fn kcp_connect(
 
     // One reader per client session: decrypt, strip the FEC framing, and hand
     // the segments to the driver. Ends when the driver's receiver is dropped.
+    // One decoder per session, as kcp-go has: sequence numbers are per
+    // session, so a shared one would interleave grids.
+    let mut fec = FecDecoder::new(config.datashard, config.parityshard);
+
     tokio::spawn(async move {
         let mut buf = vec![0u8; MTU_LIMIT];
         loop {
@@ -2122,13 +2380,12 @@ pub async fn kcp_connect(
                 }
             };
             let mut packet = buf[..n].to_vec();
-            let range = match packet_unframe(&crypt, &mut packet) {
-                Some(range) => range,
-                None => continue,
-            };
-            let segments = packet[range].to_vec();
-            if tx.send(segments).await.is_err() {
-                return;
+            // A parity shard yields nothing of its own but may complete a
+            // group, so one datagram can produce several segment blocks.
+            for segments in packet_unframe_fec(&crypt, &mut packet, fec.as_mut()) {
+                if tx.send(segments).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -3202,6 +3459,120 @@ mod fec_compat_tests {
         let size = u16::from_le_bytes([recovered[0], recovered[1]]) as usize;
         assert_eq!(size, 2 + payloads[lost].len());
         assert_eq!(&recovered[2..size], payloads[lost]);
+    }
+
+    #[test]
+    fn test_decoder_recovers_a_dropped_data_shard() {
+        // Encode a group, drop one data packet on the way in, and check the
+        // decoder hands the missing payload back.
+        const DATA: usize = 3;
+        const PARITY: usize = 2;
+        let payload_offset = super::CRYPT_HEADER_SIZE + super::FEC_HEADER_SIZE;
+
+        let mut enc = super::FecEncoder::new(DATA as u32, PARITY as u32).unwrap();
+        let payloads: [&[u8]; DATA] = [b"alpha-segment", b"beta", b"gamma-segment-longer"];
+
+        let mut packets = Vec::new();
+        let mut parity = Vec::new();
+        for p in payloads {
+            let pkt = data_packet(&mut enc, p);
+            let out = enc.push(&pkt, payload_offset);
+            packets.push(pkt);
+            if !out.is_empty() {
+                parity = out;
+            }
+        }
+
+        let mut dec = super::FecDecoder::new(DATA as u32, PARITY as u32).unwrap();
+        let dropped = 1;
+        let mut recovered = Vec::new();
+
+        // Feed the surviving data shards, then the parity.
+        for (i, pkt) in packets.iter().enumerate() {
+            if i == dropped {
+                continue;
+            }
+            let seqid = u32::from_le_bytes([
+                pkt[super::CRYPT_HEADER_SIZE],
+                pkt[super::CRYPT_HEADER_SIZE + 1],
+                pkt[super::CRYPT_HEADER_SIZE + 2],
+                pkt[super::CRYPT_HEADER_SIZE + 3],
+            ]);
+            recovered.extend(dec.decode(seqid, super::TYPE_DATA, &pkt[payload_offset..]));
+        }
+        assert!(
+            recovered.is_empty(),
+            "nothing is recoverable until enough shards have arrived"
+        );
+
+        for shard in &parity {
+            let seqid = u32::from_le_bytes([
+                shard[super::CRYPT_HEADER_SIZE],
+                shard[super::CRYPT_HEADER_SIZE + 1],
+                shard[super::CRYPT_HEADER_SIZE + 2],
+                shard[super::CRYPT_HEADER_SIZE + 3],
+            ]);
+            recovered.extend(dec.decode(seqid, super::TYPE_PARITY, &shard[payload_offset..]));
+        }
+
+        assert_eq!(recovered.len(), 1, "exactly the dropped shard comes back");
+        let segments = super::fec_payload_segments(&recovered[0])
+            .expect("the recovered shard must declare a valid length");
+        assert_eq!(segments, payloads[dropped]);
+    }
+
+    #[test]
+    fn test_decoder_is_silent_when_nothing_was_lost() {
+        // A complete group must not produce phantom recoveries.
+        const DATA: usize = 2;
+        const PARITY: usize = 2;
+        let payload_offset = super::CRYPT_HEADER_SIZE + super::FEC_HEADER_SIZE;
+
+        let mut enc = super::FecEncoder::new(DATA as u32, PARITY as u32).unwrap();
+        let mut dec = super::FecDecoder::new(DATA as u32, PARITY as u32).unwrap();
+
+        let mut recovered = Vec::new();
+        for i in 0..DATA {
+            let pkt = data_packet(&mut enc, &[i as u8; 12]);
+            let seqid = u32::from_le_bytes([
+                pkt[super::CRYPT_HEADER_SIZE],
+                pkt[super::CRYPT_HEADER_SIZE + 1],
+                pkt[super::CRYPT_HEADER_SIZE + 2],
+                pkt[super::CRYPT_HEADER_SIZE + 3],
+            ]);
+            enc.push(&pkt, payload_offset);
+            recovered.extend(dec.decode(seqid, super::TYPE_DATA, &pkt[payload_offset..]));
+        }
+
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn test_decoder_ignores_a_duplicate() {
+        const DATA: usize = 2;
+        const PARITY: usize = 2;
+        let mut dec = super::FecDecoder::new(DATA as u32, PARITY as u32).unwrap();
+
+        let payload = [0x04, 0x00, 0xAA, 0xBB];
+        assert!(dec.decode(0, super::TYPE_DATA, &payload).is_empty());
+        // The same sequence number again must not enter the window twice; a
+        // duplicated shard would otherwise be counted towards the group and
+        // could trigger a bogus reconstruction.
+        assert!(dec.decode(0, super::TYPE_DATA, &payload).is_empty());
+        assert_eq!(dec.rx.len(), 1);
+    }
+
+    #[test]
+    fn test_fec_payload_segments_rejects_a_bad_length() {
+        // Length shorter than the header, and longer than the buffer.
+        assert_eq!(super::fec_payload_segments(&[0x01, 0x00, 0xAA]), None);
+        assert_eq!(super::fec_payload_segments(&[0xFF, 0x00, 0xAA]), None);
+        assert_eq!(super::fec_payload_segments(&[0x00]), None);
+        // A well-formed one yields exactly the declared span.
+        assert_eq!(
+            super::fec_payload_segments(&[0x04, 0x00, 0xAA, 0xBB, 0xCC]),
+            Some(&[0xAA, 0xBB][..])
+        );
     }
 
     #[test]
