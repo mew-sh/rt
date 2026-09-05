@@ -2128,13 +2128,10 @@ impl KcpListener {
                     };
 
                     let mut packet = buf[..n].to_vec();
-                    let decoder = match FecDecoder::new(
-                        self.config.datashard,
-                        self.config.parityshard,
-                    ) {
-                        Some(fresh) => Some(fec.entry(peer).or_insert(fresh)),
-                        None => None,
-                    };
+                    // Constructed per packet only to learn whether FEC is
+                    // configured at all; an existing peer keeps its own.
+                    let decoder = FecDecoder::new(self.config.datashard, self.config.parityshard)
+                        .map(|fresh| fec.entry(peer).or_insert(fresh));
                     let blocks = packet_unframe_fec(&self.crypt, &mut packet, decoder);
 
                     // A parity shard carries no segments of its own but can
