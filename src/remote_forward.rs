@@ -230,3 +230,109 @@ mod tests {
         handle.abort();
     }
 }
+
+/// UDP Remote Forward Handler: relays each accepted association to a local
+/// target.
+///
+/// This is the mirror of [`UdpDirectForwardHandler`](crate::forward): there the
+/// chain carries the *outbound* datagrams, here the chain is what carried the
+/// listener to the far end, so the target is dialled directly
+/// (forward.go:317-348).
+pub struct UdpRemoteForwardHandler {
+    raddr: String,
+    group: NodeGroup,
+    options: HandlerOptions,
+}
+
+impl UdpRemoteForwardHandler {
+    pub fn new(raddr: &str, options: HandlerOptions) -> Self {
+        let mut group = NodeGroup::new(Vec::new());
+        for (i, addr) in raddr.split(',').filter(|a| !a.is_empty()).enumerate() {
+            let mut node = Node::default();
+            node.id = i + 1;
+            node.addr = addr.to_string();
+            node.host = addr.to_string();
+            group.add_node(node);
+        }
+        group.set_selector(std::sync::Arc::new(
+            crate::selector::FilterSelector::with_filters(
+                &options.strategy,
+                options.max_fails,
+                options.fail_timeout,
+                options.fastest_count,
+            ),
+        ));
+
+        Self {
+            raddr: raddr.to_string(),
+            group,
+            options,
+        }
+    }
+}
+
+#[async_trait]
+impl Handler for UdpRemoteForwardHandler {
+    async fn handle(&self, mut conn: ProxyConn) -> Result<(), HandlerError> {
+        let peer_addr = conn.peer_addr_str();
+
+        let mut node = Node::default();
+        if !self.group.nodes().is_empty() {
+            node = self
+                .group
+                .next()
+                .map_err(|e| HandlerError::Proxy(e.to_string()))?;
+        }
+        let target = if node.addr.is_empty() {
+            self.raddr.clone()
+        } else {
+            node.addr.clone()
+        };
+
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        if let Err(e) = socket.connect(&target).await {
+            node.mark_dead();
+            return Err(HandlerError::Io(e));
+        }
+        node.reset_dead();
+
+        // An association whose peer went quiet has to be reclaimed; otherwise
+        // one relay per source address accumulates for the life of the process.
+        let idle = if self.options.timeout.is_zero() {
+            std::time::Duration::from_secs(60)
+        } else {
+            self.options.timeout
+        };
+
+        info!("[rudp] {} <-> {}", peer_addr, target);
+        let mut from_peer = vec![0u8; 65535];
+        let mut from_target = vec![0u8; 65535];
+        loop {
+            tokio::select! {
+                result = tokio::time::timeout(idle, conn.read(&mut from_peer)) => {
+                    match result {
+                        Err(_) => break,
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => { socket.send(&from_peer[..n]).await?; }
+                        Ok(Err(e)) => {
+                            debug!("[rudp] {} read: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                }
+                result = tokio::time::timeout(idle, socket.recv(&mut from_target)) => {
+                    match result {
+                        Err(_) => break,
+                        Ok(Ok(n)) => { conn.write_all(&from_target[..n]).await?; }
+                        Ok(Err(e)) => {
+                            debug!("[rudp] {} recv: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        info!("[rudp] {} >-< {}", peer_addr, target);
+        Ok(())
+    }
+}

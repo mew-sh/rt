@@ -421,6 +421,9 @@ async fn run_server(
     // worse than one that fails to start.
     ensure_listener_transport_supported(&node)?;
 
+    // Taken before the chain is moved into the handler options; `rudp` needs
+    // to know whether one was configured.
+    let chain_is_empty = chain.is_empty();
     let handler_opts = build_handler_options(&node, chain);
 
     let addr = node.bind_addr();
@@ -486,7 +489,14 @@ async fn run_server(
         "relay" => serve!(RelayHandler::new(&remote, handler_opts)),
         "sni" => serve!(SniHandler::new(handler_opts)),
         "tcp" => serve!(TcpDirectForwardHandler::new(&remote, handler_opts)),
-        "udp" | "rudp" => serve!(UdpDirectForwardHandler::new(&remote, handler_opts)),
+        "udp" => serve!(UdpDirectForwardHandler::new(&remote, handler_opts)),
+        // `rudp` differs from `udp` in which side the chain carries: here it
+        // carries the listener to the far end, so the target is dialled
+        // directly (forward.go:317-348).
+        "rudp" => serve!(remote_forward::UdpRemoteForwardHandler::new(
+            &remote,
+            handler_opts
+        )),
         "rtcp" => serve!(TcpRemoteForwardHandler::new(&remote, handler_opts)),
         "dns" | "dot" | "doh" => serve!(DnsHandler::new(&remote, handler_opts)),
         "red" | "redirect" => serve!(TcpRedirectHandler::new(handler_opts), true),
@@ -515,7 +525,7 @@ async fn run_server(
         // `forward+ssh` is a plain TCP listener in gost too (route.go:458-462):
         // the SSH server handshake happens per connection inside the handler,
         // which is also where authentication is enforced.
-        "" | "tcp" | "ssh" | "rtcp" | "rudp" | "dns" | "redu" => {
+        "" | "tcp" | "ssh" | "rtcp" | "dns" | "redu" => {
             let server = Server::new(&addr, handler)
                 .await?
                 .with_original_dst(capture_original_dst);
@@ -669,7 +679,21 @@ async fn run_server(
         }
         // A UDP listener yields one virtual connection per source address, so
         // the ordinary handlers serve it unchanged (gost's udp.go model).
-        "udp" => {
+        // `rudp` used to ride the TCP listener, which meant `-L rudp://` bound
+        // a TCP port and never received a datagram at all.
+        "udp" | "rudp" => {
+            if node.transport == "rudp" && !chain_is_empty {
+                // gost binds the port at the far end of the chain over a SOCKS5
+                // UDP tunnel (forward.go:723-745). Binding locally instead
+                // would put the listener on the wrong machine, so refuse.
+                return Err(format!(
+                    "`-L rudp://` through a chain is not implemented (in {}); the port would \
+                     have to be bound at the far end over a SOCKS5 UDP tunnel, and binding it \
+                     locally would listen on the wrong host",
+                    node
+                )
+                .into());
+            }
             let server = UdpServer::new(&addr, udp_listen_config(&node), handler).await?;
             let server_cancel = server.cancel_token();
             let cancel_clone = cancel.clone();
