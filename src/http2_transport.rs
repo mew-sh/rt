@@ -127,10 +127,25 @@ impl Http2Handler {
     ) -> Result<(), HandlerError> {
         let agent = self.proxy_agent();
 
-        let Some(host) = request_target(&request) else {
+        let Some(mut host) = request_target(&request) else {
             let _ = send_status(&mut respond, StatusCode::BAD_REQUEST, &agent).await;
             return Ok(());
         };
+
+        // gost's SNI client can reach an HTTP/2 proxy too, and carries the real
+        // destination here with a decoy in the authority (http2.go:345).
+        let carried = header_str(&request, "gost-target");
+        if !carried.is_empty() {
+            if let Some(real) = crate::sni::decode_server_name(&carried) {
+                let port = host.rsplit_once(':').map(|(_, p)| p).unwrap_or("80");
+                debug!("[http2] Gost-Target overrides the authority with {}", real);
+                host = if real.contains(':') {
+                    real
+                } else {
+                    format!("{real}:{port}")
+                };
+            }
+        }
 
         info!("[http2] {} -> {}", peer, host);
 

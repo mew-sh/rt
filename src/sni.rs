@@ -1,5 +1,8 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 use crate::conn::ProxyConn;
@@ -447,6 +450,163 @@ fn extract_sni(data: &[u8]) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Client side
+// ---------------------------------------------------------------------------
+
+/// Rewrites the first request so the real destination travels privately.
+///
+/// gost's `sniClientConn` (sni.go:191-271) touches only the first write, and
+/// only when a decoy `?host=` is configured. A TLS ClientHello has its server
+/// name moved into extension 0xFFFE and replaced by the decoy; an HTTP request
+/// has its `Host` header replaced and the real one carried in `Gost-Target`.
+/// Everything after that first write passes through untouched.
+pub struct SniClientConn<S> {
+    inner: S,
+    /// The decoy name. Empty disables rewriting entirely, as in gost.
+    host: String,
+    obfuscated: bool,
+    /// Rewritten bytes still to be written.
+    out: Vec<u8>,
+    out_pos: usize,
+}
+
+impl<S> SniClientConn<S> {
+    pub fn new(inner: S, host: &str) -> Self {
+        Self {
+            inner,
+            host: host.to_string(),
+            obfuscated: false,
+            out: Vec::new(),
+            out_pos: 0,
+        }
+    }
+}
+
+/// Rewrites an HTTP request head, moving the real `Host` into `Gost-Target`.
+///
+/// Returns `None` when there is no `Host` header to move, so the request goes
+/// out unchanged rather than half-rewritten.
+fn obfuscate_http(request: &[u8], decoy: &str) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(request).ok()?;
+    let (head, rest) = text.split_once("\r\n\r\n")?;
+
+    let mut out = String::with_capacity(text.len() + 96);
+    let mut found = false;
+    for line in head.split("\r\n") {
+        // `Host` only; `Host-Something` is a different header.
+        let is_host = line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("host"));
+        if is_host && !found {
+            let real = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+            out.push_str(&format!("Host: {decoy}\r\n"));
+            out.push_str(&format!("Gost-Target: {}\r\n", encode_server_name(real)));
+            found = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    if !found {
+        return None;
+    }
+    out.push_str("\r\n");
+    out.push_str(rest);
+    Some(out.into_bytes())
+}
+
+impl<S: AsyncWrite + Unpin> SniClientConn<S> {
+    fn flush_out(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.out_pos < self.out.len() {
+            let Self {
+                inner,
+                out,
+                out_pos,
+                ..
+            } = self;
+            match Pin::new(inner).poll_write(cx, &out[*out_pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "sni: write returned zero",
+                    )))
+                }
+                Poll::Ready(Ok(n)) => *out_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.out.clear();
+        self.out_pos = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for SniClientConn<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for SniClientConn<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.flush_out(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if self.obfuscated || self.host.is_empty() || buf.is_empty() {
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
+
+        let host = self.host.clone();
+        let rewritten = if buf[0] == TLS_HANDSHAKE {
+            rewrite_client_hello(buf, &host, true).map(|(record, _)| record)
+        } else {
+            obfuscate_http(buf, &host)
+        };
+        self.obfuscated = true;
+
+        match rewritten {
+            // Nothing recognisable to rewrite: pass it through rather than
+            // dropping or mangling it, as gost does.
+            None => Pin::new(&mut self.inner).poll_write(cx, buf),
+            Some(bytes) => {
+                self.out = bytes;
+                self.out_pos = 0;
+                match self.flush_out(cx) {
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    // The rewritten form is buffered; a partial flush finishes
+                    // on the next poll. The caller's bytes are all accounted
+                    // for either way.
+                    _ => Poll::Ready(Ok(buf.len())),
+                }
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.flush_out(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_flush(cx),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.flush_out(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_shutdown(cx),
+            other => other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +797,130 @@ mod tests {
         assert!(
             !exts.iter().any(|(t, _)| *t == EXT_GOST_HOST),
             "the private extension must be removed before the origin sees it"
+        );
+    }
+
+    // ---- client connector ----
+
+    /// Writes `payload` through the connector and returns what reached the
+    /// far side.
+    async fn through_client(payload: &[u8], decoy: &str) -> Vec<u8> {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            sock.read_to_end(&mut got).await.unwrap();
+            got
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let mut client = SniClientConn::new(sock, decoy);
+        client.write_all(payload).await.unwrap();
+        client.flush().await.unwrap();
+        // Half-close so the reader sees EOF rather than waiting on a byte
+        // count it cannot predict.
+        client.shutdown().await.unwrap();
+
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_client_connector_rewrites_the_client_hello() {
+        let hello = client_hello_for("secret.example");
+        let seen = through_client(&hello, "decoy.example").await;
+
+        assert_eq!(extract_sni(&seen).as_deref(), Some("decoy.example"));
+        assert!(
+            !seen
+                .windows(b"secret.example".len())
+                .any(|w| w == b"secret.example"),
+            "the real name must not be on the wire in clear"
+        );
+
+        // And a server recovers it.
+        let (_, host) = rewrite_client_hello(&seen, "", false).unwrap();
+        assert_eq!(host, "secret.example");
+    }
+
+    #[tokio::test]
+    async fn test_client_connector_rewrites_the_http_host() {
+        let request = b"GET /page HTTP/1.1\r\nHost: secret.example\r\nUser-Agent: x\r\n\r\n";
+        let seen = through_client(request, "decoy.example").await;
+        let text = String::from_utf8(seen).unwrap();
+
+        assert!(text.contains("Host: decoy.example\r\n"), "got: {text}");
+        assert!(text.contains("Gost-Target: "), "got: {text}");
+        assert!(!text.contains("Host: secret.example"), "got: {text}");
+        assert!(
+            text.contains("User-Agent: x\r\n"),
+            "other headers must survive"
+        );
+
+        // The carried name decodes back.
+        let target = text
+            .split("Gost-Target: ")
+            .nth(1)
+            .and_then(|s| s.split("\r\n").next())
+            .unwrap();
+        assert_eq!(
+            decode_server_name(target).as_deref(),
+            Some("secret.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_connector_only_touches_the_first_write() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            // Read to EOF: a fixed read count would race TCP coalescing the
+            // two writes into one segment, which is exactly how this hung.
+            sock.read_to_end(&mut got).await.unwrap();
+            got
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let mut client = SniClientConn::new(sock, "decoy.example");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: secret.example\r\n\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        // A second write that happens to look like a Host line must pass
+        // through verbatim.
+        client.write_all(b"Host: secret.example\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let text = String::from_utf8(server.await.unwrap()).unwrap();
+        assert!(
+            text.ends_with("Host: secret.example\r\n"),
+            "later writes must not be rewritten: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_connector_without_a_decoy_is_a_pass_through() {
+        // gost only obfuscates when a decoy host is configured.
+        let hello = client_hello_for("secret.example");
+        let seen = through_client(&hello, "").await;
+        assert_eq!(seen, hello);
+    }
+
+    #[test]
+    fn test_obfuscate_http_leaves_a_request_without_a_host_alone() {
+        assert_eq!(
+            obfuscate_http(b"GET / HTTP/1.0\r\n\r\n", "decoy.example"),
+            None
         );
     }
 

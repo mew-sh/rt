@@ -928,6 +928,16 @@ async fn connect_via(
         // CONNECT is ever sent, so a node like `-F tls://host:443` reaches the
         // proxy and then asks it for nothing.
         "http" | "" => http_connect(stream, target, node.user.as_ref()).await,
+        // gost's SNI connector sends nothing at connect time: it wraps the
+        // connection so the first request is rewritten on its way out
+        // (sni.go:34-45).
+        "sni" => {
+            let peer = stream.peer_addr();
+            let local = stream.local_addr();
+            let decoy = node.get("host").unwrap_or_default();
+            let wrapped = crate::sni::SniClientConn::new(stream, decoy);
+            Ok(ProxyConn::layered(Box::new(wrapped), peer, local))
+        }
         // The TLS layer already ran; this opens the CONNECT stream on it.
         "http2" => {
             let peer = stream.peer_addr();

@@ -266,6 +266,10 @@ impl Handler for HttpHandler {
         let mut headers = Vec::new();
         let mut proxy_auth = String::new();
         let mut host_header = String::new();
+        // gost's SNI client puts the real destination here and leaves a decoy
+        // in `Host` (sni.go:255-263); the HTTP handler is where it is consumed
+        // and stripped (http.go:146-170).
+        let mut gost_target = String::new();
         loop {
             let mut line = String::new();
             buf_reader.read_line(&mut line).await?;
@@ -277,8 +281,33 @@ impl Handler for HttpHandler {
                 proxy_auth = trimmed[20..].trim().to_string();
             } else if trimmed.to_lowercase().starts_with("host:") {
                 host_header = trimmed[5..].trim().to_string();
+            } else if trimmed.to_lowercase().starts_with("gost-target:") {
+                gost_target = trimmed[12..].trim().to_string();
+                // Not forwarded: it is an artefact of the hop, and the origin
+                // has no use for it.
+                continue;
             }
             headers.push(trimmed);
+        }
+
+        // A bad checksum means the header is corrupt or forged, so the decoy
+        // Host stands rather than the connection being redirected.
+        if !gost_target.is_empty() {
+            if let Some(real) = crate::sni::decode_server_name(&gost_target) {
+                debug!("[http] Gost-Target overrides Host with {}", real);
+                // The forwarded `Host` has to be corrected too, not just the
+                // address dialled: gost assigns req.Host, which is what Go
+                // re-serialises the header from. Leaving the decoy in place
+                // reaches the right origin and then gets rejected by it -- a
+                // real 409 from example.com is how this was caught.
+                for header in headers.iter_mut() {
+                    if header.to_lowercase().starts_with("host:") {
+                        *header = format!("Host: {real}");
+                        break;
+                    }
+                }
+                host_header = real;
+            }
         }
 
         // The BufReader reads ahead, so bytes the client coalesced after the
@@ -1004,6 +1033,114 @@ hello",
     /// A POST whose body arrives in the same TCP segment as its headers must
     /// reach the origin server. The header reader buffers ahead, so those
     /// bytes were previously dropped along with the reader.
+    #[tokio::test]
+    async fn test_gost_target_restores_the_real_host() {
+        // gost's SNI client leaves a decoy in Host and carries the real name
+        // in Gost-Target. The proxy must dial the real origin *and* correct
+        // the Host it forwards, or the origin answers 4xx to a name it does
+        // not serve.
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+
+        let received = tokio::spawn(async move {
+            let (mut conn, _) = origin.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let mut total = Vec::new();
+            while !total.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = conn.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total.extend_from_slice(&buf[..n]);
+            }
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .ok();
+            String::from_utf8_lossy(&total).to_string()
+        });
+
+        let handler = HttpHandler::new(HandlerOptions::default());
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (conn, _) = proxy.accept().await.unwrap();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let real = origin_addr.to_string();
+        let req = format!(
+            "GET /page HTTP/1.1\r\nHost: decoy.example\r\nGost-Target: {}\r\n\r\n",
+            crate::sni::encode_server_name(&real)
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), received)
+            .await
+            .expect("origin did not receive the request")
+            .unwrap();
+
+        assert!(
+            got.contains(&format!("Host: {real}")),
+            "the forwarded Host must be the real one, got: {got}"
+        );
+        assert!(
+            !got.contains("decoy.example"),
+            "the decoy must not reach the origin, got: {got}"
+        );
+        assert!(
+            !got.to_lowercase().contains("gost-target"),
+            "the hop header must be stripped, got: {got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gost_target_with_a_bad_checksum_is_ignored() {
+        // A forged or corrupted value must not redirect the connection.
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+
+        let received = tokio::spawn(async move {
+            let (mut conn, _) = origin.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let mut total = Vec::new();
+            while !total.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = conn.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total.extend_from_slice(&buf[..n]);
+            }
+            String::from_utf8_lossy(&total).to_string()
+        });
+
+        let handler = HttpHandler::new(HandlerOptions::default());
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (conn, _) = proxy.accept().await.unwrap();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
+        });
+
+        // Host names the origin; Gost-Target is nonsense and must be dropped.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let req = format!(
+            "GET /page HTTP/1.1\r\nHost: {origin_addr}\r\nGost-Target: bm90LWEtdmFsaWQ\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), received)
+            .await
+            .expect("origin did not receive the request")
+            .unwrap();
+
+        assert!(got.contains(&format!("Host: {origin_addr}")), "got: {got}");
+        assert!(
+            !got.to_lowercase().contains("gost-target"),
+            "the hop header must be stripped even when it is invalid, got: {got}"
+        );
+    }
+
     #[tokio::test]
     async fn test_forward_mode_preserves_coalesced_request_body() {
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
