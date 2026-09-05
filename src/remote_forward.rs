@@ -152,85 +152,6 @@ impl TcpRemoteForwardListener {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_tcp_remote_forward_handler() {
-        // Start a mock local target
-        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut conn, _) = target.accept().await.unwrap();
-            let mut buf = vec![0u8; 1024];
-            let n = conn.read(&mut buf).await.unwrap();
-            conn.write_all(&buf[..n]).await.unwrap(); // echo
-        });
-
-        // Create remote forward handler
-        let handler =
-            TcpRemoteForwardHandler::new(&target_addr.to_string(), HandlerOptions::default());
-
-        // Start proxy that uses the handler
-        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (conn, _) = proxy.accept().await.unwrap();
-            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
-        });
-
-        // Connect to proxy and send data
-        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-        client.write_all(b"reverse tunnel").await.unwrap();
-
-        let mut buf = vec![0u8; 1024];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"reverse tunnel");
-    }
-
-    #[tokio::test]
-    async fn test_tcp_remote_forward_listener() {
-        // Start a mock local target that echoes
-        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_addr = target.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut conn, _) = target.accept().await.unwrap();
-            let mut buf = vec![0u8; 1024];
-            let n = conn.read(&mut buf).await.unwrap();
-            conn.write_all(&buf[..n]).await.unwrap();
-        });
-
-        // Create remote forward listener
-        let listener_bind = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listener_addr = listener_bind.local_addr().unwrap();
-        drop(listener_bind); // release the port
-
-        let rfwd =
-            TcpRemoteForwardListener::new(&listener_addr.to_string(), &target_addr.to_string());
-
-        let handle = tokio::spawn(async move {
-            rfwd.serve().await.ok();
-        });
-
-        // Wait for listener to be ready
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Connect and test
-        let mut client = TcpStream::connect(listener_addr).await.unwrap();
-        client.write_all(b"remote fwd").await.unwrap();
-
-        let mut buf = vec![0u8; 1024];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"remote fwd");
-
-        handle.abort();
-    }
-}
-
 /// UDP Remote Forward Handler: relays each accepted association to a local
 /// target.
 ///
@@ -334,5 +255,84 @@ impl Handler for UdpRemoteForwardHandler {
         }
         info!("[rudp] {} >-< {}", peer_addr, target);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_tcp_remote_forward_handler() {
+        // Start a mock local target
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut conn, _) = target.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = conn.read(&mut buf).await.unwrap();
+            conn.write_all(&buf[..n]).await.unwrap(); // echo
+        });
+
+        // Create remote forward handler
+        let handler =
+            TcpRemoteForwardHandler::new(&target_addr.to_string(), HandlerOptions::default());
+
+        // Start proxy that uses the handler
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (conn, _) = proxy.accept().await.unwrap();
+            handler.handle(ProxyConn::from_tcp(conn)).await.ok();
+        });
+
+        // Connect to proxy and send data
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(b"reverse tunnel").await.unwrap();
+
+        let mut buf = vec![0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"reverse tunnel");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_remote_forward_listener() {
+        // Start a mock local target that echoes
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut conn, _) = target.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = conn.read(&mut buf).await.unwrap();
+            conn.write_all(&buf[..n]).await.unwrap();
+        });
+
+        // Create remote forward listener
+        let listener_bind = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener_bind.local_addr().unwrap();
+        drop(listener_bind); // release the port
+
+        let rfwd =
+            TcpRemoteForwardListener::new(&listener_addr.to_string(), &target_addr.to_string());
+
+        let handle = tokio::spawn(async move {
+            rfwd.serve().await.ok();
+        });
+
+        // Wait for listener to be ready
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Connect and test
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        client.write_all(b"remote fwd").await.unwrap();
+
+        let mut buf = vec![0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"remote fwd");
+
+        handle.abort();
     }
 }
