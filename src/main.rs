@@ -684,12 +684,14 @@ async fn run_server(
         "udp" | "rudp" => {
             if node.transport == "rudp" && !chain_is_empty {
                 // gost binds the port at the far end of the chain over a SOCKS5
-                // UDP tunnel (forward.go:723-745). Binding locally instead
+                // UDP association (forward.go:723-745). Binding locally instead
                 // would put the listener on the wrong machine, so refuse.
                 return Err(format!(
-                    "`-L rudp://` through a chain is not implemented (in {}); the port would \
-                     have to be bound at the far end over a SOCKS5 UDP tunnel, and binding it \
-                     locally would listen on the wrong host",
+                    concat!(
+                        "`-L rudp://` through a chain is not implemented (in {}); the port ",
+                        "would have to be bound at the far end over a SOCKS5 UDP association, ",
+                        "and binding it locally would listen on the wrong host"
+                    ),
                     node
                 )
                 .into());

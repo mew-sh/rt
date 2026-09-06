@@ -261,8 +261,11 @@ impl Chain {
         // open a UDP association we tunnel over that same connection.
         let control = self.dial(&last.addr).await?;
         let connector = crate::socks5::Socks5Connector::new(last.user.clone());
+        // The bind address is what the far end is asked to listen on. Callers
+        // that only need an ephemeral source pass 0.0.0.0:0; `rudp` passes the
+        // port it wants bound over there (forward.go:723-745).
         let tunnel = connector
-            .udp_tunnel(control, "0.0.0.0:0", None)
+            .udp_tunnel(control, &bind.to_string(), None)
             .await
             .map_err(|e| ChainError::ProxyError(format!("socks5 UDP tunnel failed: {}", e)))?;
 
